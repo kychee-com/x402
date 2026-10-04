@@ -10,6 +10,7 @@ import type { ReplayStore } from "../../src/types";
 import {
   HTTP_A_HASH,
   HTTP_B_HASH,
+  type InvoiceSpec,
   OTHER_KEY,
   SPEC_PREIMAGE,
   SPEC_TIME,
@@ -297,7 +298,7 @@ describe("core field, invoice, and preimage checks", () => {
       { rawFields: [[23, bech32.toWords(hexToBytes(HTTP_A_HASH))]] },
       "invalid_exact_lnbtc_invoice_description",
     ],
-  ])("rejects an accepted invoice with %o", async (spec, reason) => {
+  ] as [InvoiceSpec, string][])("rejects an accepted invoice with %o", async (spec, reason) => {
     const accepted = requirementsFor(httpArticle(), makeInvoice(spec).invoice);
     expect((await settle(payloadFor(accepted))).errorReason).toBe(reason);
   });
