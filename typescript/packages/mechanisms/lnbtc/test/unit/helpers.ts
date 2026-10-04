@@ -36,10 +36,26 @@ export interface InvoiceSpec {
   payeeField?: boolean;
   key?: Uint8Array;
   extraPaymentHash?: boolean;
+  /** Raw `p` field words; `null` omits the payment hash. */
+  paymentHashWords?: number[] | null;
   omitPaymentSecret?: boolean;
   unknownField?: boolean;
   /** Overrides the whole human-readable prefix (amount and currency). */
   hrp?: string;
+  /** Raw `x` field words, replacing the minimal encoding of `expiry`. */
+  expiryWords?: number[];
+  /** Raw `c` field words, replacing the minimal encoding of `minFinalCltv`. */
+  minFinalCltvWords?: number[];
+  /** Raw `9` (features) field words. */
+  featureWords?: number[];
+  /** Extra raw tagged fields appended after the standard ones, as [tag, words]. */
+  rawFields?: [number, number[]][];
+  /** Raw words appended after the tagged fields (may be a malformed field). */
+  trailingWords?: number[];
+  /** Emit the high-S form of the signature (and the matching recovery id). */
+  highS?: boolean;
+  /** Overrides the recovery id byte. */
+  recovery?: number;
 }
 
 /**
@@ -59,7 +75,9 @@ export function makeInvoice(spec: InvoiceSpec = {}): { invoice: string; paymentH
   const words: number[] = [...numberToWords(spec.timestamp ?? SPEC_TIME, 7)];
   const field = (tag: number, data: number[]) =>
     words.push(tag, Math.floor(data.length / 32), data.length % 32, ...data);
-  field(1, bech32.toWords(hexToBytes(paymentHash)));
+  if (spec.paymentHashWords !== null) {
+    field(1, spec.paymentHashWords ?? bech32.toWords(hexToBytes(paymentHash)));
+  }
   if (spec.extraPaymentHash) field(1, bech32.toWords(sha256(Uint8Array.of(9))));
   if (!spec.omitPaymentSecret) {
     field(16, bech32.toWords(hexToBytes(spec.paymentSecret ?? "11".repeat(32))));
@@ -71,14 +89,28 @@ export function makeInvoice(spec: InvoiceSpec = {}): { invoice: string; paymentH
   if (descriptionHash !== null) field(23, bech32.toWords(hexToBytes(descriptionHash)));
   if (spec.payeeField) field(19, bech32.toWords(secp256k1.getPublicKey(key, true)));
   const expiry = spec.expiry === undefined ? 300 : spec.expiry;
-  if (expiry !== null) field(6, minimalWords(expiry));
-  field(24, minimalWords(spec.minFinalCltv ?? 18));
+  if (spec.expiryWords) field(6, spec.expiryWords);
+  else if (expiry !== null) field(6, minimalWords(expiry));
+  field(24, spec.minFinalCltvWords ?? minimalWords(spec.minFinalCltv ?? 18));
+  if (spec.featureWords) field(5, spec.featureWords);
   if (spec.unknownField) field(31, [1, 2, 3]);
+  for (const [tag, data] of spec.rawFields ?? []) field(tag, data);
+  if (spec.trailingWords) words.push(...spec.trailingWords);
 
   const data = Uint8Array.from(scure.convertRadix2(words, 5, 8, true));
   const message = new Uint8Array([...new TextEncoder().encode(hrp), ...data]);
-  const signature = secp256k1.sign(sha256(message), key);
-  const sigBytes = new Uint8Array([...signature.toCompactRawBytes(), signature.recovery]);
+  let signature = secp256k1.sign(sha256(message), key);
+  if (spec.highS) {
+    signature = new secp256k1.Signature(
+      signature.r,
+      secp256k1.CURVE.n - signature.s,
+      signature.recovery ^ 1,
+    );
+  }
+  const sigBytes = new Uint8Array([
+    ...signature.toCompactRawBytes(),
+    spec.recovery ?? (signature.recovery as number),
+  ]);
   const invoice = bech32.encode(hrp, [...words, ...bech32.toWords(sigBytes)], false);
   return { invoice, paymentHash };
 }

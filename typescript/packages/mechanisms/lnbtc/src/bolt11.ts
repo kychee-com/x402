@@ -32,7 +32,7 @@ const TIMESTAMP_WORDS = 7;
 const DEFAULT_EXPIRY_SECONDS = 3600;
 const MSAT_PER_BTC = 100_000_000_000n;
 
-// Multiplier → (numerator, denominator) of BTC; amount * BTC_in_msat * num / den.
+// Multiplier → divisor of the BTC amount in msat.
 const MULTIPLIERS: Record<string, bigint> = {
   m: 1_000n, // milli: 1e-3 BTC = 1e8 msat
   u: 1_000_000n,
@@ -40,14 +40,36 @@ const MULTIPLIERS: Record<string, bigint> = {
   p: 1_000_000_000_000n,
 };
 
-const TAG = { p: 1, s: 16, d: 13, h: 23, x: 6, n: 19 } as const;
+const TAG = { p: 1, s: 16, d: 13, h: 23, x: 6, n: 19, c: 24, features: 5 } as const;
+
+// BOLT11: a reader MUST fail when a fixed-length field has another length.
+const FIXED_LENGTHS: ReadonlyMap<number, number> = new Map([
+  [TAG.p, 52],
+  [TAG.s, 52],
+  [TAG.h, 52],
+  [TAG.n, 53],
+]);
+
+// Fields that may appear at most once; BOLT11 asks for minimal integer encodings.
+const SINGLETON_TAGS: ReadonlySet<number> = new Set([
+  TAG.p,
+  TAG.s,
+  TAG.n,
+  TAG.x,
+  TAG.c,
+  TAG.features,
+]);
+const MINIMAL_TAGS: ReadonlySet<number> = new Set([TAG.x, TAG.c, TAG.features]);
 
 /**
  * Decodes a BOLT11 invoice and verifies its signature.
  *
  * Strict: rejects mixed case, a `lightning:` prefix, a missing or zero amount,
- * sub-millisatoshi amounts, amounts with leading zeros, a missing or duplicated
- * payment hash, a missing payment secret, and an invalid signature.
+ * sub-millisatoshi amounts, amounts with leading zeros, fixed-length fields of
+ * the wrong length or with non-zero padding, duplicated payment hash, payment
+ * secret, payee, expiry, CLTV, or feature fields, non-minimal integer fields,
+ * a missing payment secret, a high-S signature verified against an `n` field,
+ * and an invalid signature.
  *
  * @param invoice - BOLT11 invoice text
  * @returns The decoded invoice
@@ -64,29 +86,25 @@ export function decodeInvoice(invoice: string): DecodedInvoice {
   const timestamp = wordsToNumber(signed.slice(0, TIMESTAMP_WORDS));
 
   const fields = parseTaggedFields(signed.slice(TIMESTAMP_WORDS));
-  if (fields.paymentHashes.length !== 1) throw new Error("invoice needs exactly one payment hash");
-  if (fields.paymentSecrets !== 1) throw new Error("invoice needs exactly one payment secret");
-  if (fields.payees.length > 1) throw new Error("invoice has more than one payee field");
+  if (fields.paymentHash === undefined) throw new Error("invoice has no payment hash");
+  if (!fields.hasPaymentSecret) throw new Error("invoice has no payment secret");
 
   const prefixBytes = new TextEncoder().encode(prefix);
   const dataBytes = Uint8Array.from(scure.convertRadix2(signed, 5, 8, true));
   const message = new Uint8Array(prefixBytes.length + dataBytes.length);
   message.set(prefixBytes);
   message.set(dataBytes, prefixBytes.length);
-  const digest = sha256(message);
-
-  const payee = verifySignature(sigBytes, digest, fields.payees[0]);
 
   return {
     currency,
     amountMsat,
     timestamp,
     expirySeconds: fields.expiry ?? DEFAULT_EXPIRY_SECONDS,
-    paymentHash: fields.paymentHashes[0],
+    paymentHash: fields.paymentHash,
     descriptionHashes: fields.descriptionHashes,
     inlineDescriptionCount: fields.inlineDescriptions,
-    payee,
-    hasPayeeField: fields.payees.length === 1,
+    payee: verifySignature(sigBytes, sha256(message), fields.payee),
+    hasPayeeField: fields.payee !== undefined,
   };
 }
 
@@ -104,37 +122,35 @@ function parseHrp(prefix: string): { currency: string; amountMsat: bigint } {
   if (digits.length > 1 && digits.startsWith("0")) throw new Error("amount has leading zeros");
   const value = BigInt(digits);
   if (value === 0n) throw new Error("invoice amount is zero");
-  if (!multiplier) return { currency, amountMsat: value * MSAT_PER_BTC };
   const scaled = value * MSAT_PER_BTC;
+  if (!multiplier) return { currency, amountMsat: scaled };
   const divisor = MULTIPLIERS[multiplier];
   if (scaled % divisor !== 0n) throw new Error("amount is not an integral millisatoshi");
   return { currency, amountMsat: scaled / divisor };
 }
 
 interface TaggedFields {
-  paymentHashes: string[];
-  paymentSecrets: number;
+  paymentHash?: string;
+  hasPaymentSecret: boolean;
   descriptionHashes: string[];
   inlineDescriptions: number;
-  payees: string[];
+  payee?: string;
   expiry?: number;
 }
 
 /**
- * Reads BOLT11 tagged fields, skipping unknown fields and wrong-length known
- * fields as BOLT11 requires.
+ * Reads BOLT11 tagged fields, skipping unknown fields.
  *
  * @param words - 5-bit words after the timestamp, before the signature
  * @returns The fields the scheme consumes
  */
 function parseTaggedFields(words: number[]): TaggedFields {
   const out: TaggedFields = {
-    paymentHashes: [],
-    paymentSecrets: 0,
+    hasPaymentSecret: false,
     descriptionHashes: [],
     inlineDescriptions: 0,
-    payees: [],
   };
+  const seen = new Set<number>();
   let i = 0;
   while (i < words.length) {
     if (i + 3 > words.length) throw new Error("truncated tagged field");
@@ -144,24 +160,34 @@ function parseTaggedFields(words: number[]): TaggedFields {
     if (data.length !== length) throw new Error("truncated tagged field");
     i += 3 + length;
 
+    const fixedLength = FIXED_LENGTHS.get(tag);
+    if (fixedLength !== undefined && length !== fixedLength) {
+      throw new Error("tagged field has the wrong length");
+    }
+    if (SINGLETON_TAGS.has(tag)) {
+      if (seen.has(tag)) throw new Error("duplicate tagged field");
+      seen.add(tag);
+    }
+    if (MINIMAL_TAGS.has(tag) && data[0] === 0) throw new Error("non-minimal integer field");
+
     switch (tag) {
       case TAG.p:
-        if (length === 52) out.paymentHashes.push(bytesToHex(bech32.fromWords(data)));
+        out.paymentHash = bytesToHex(bech32.fromWords(data));
         break;
       case TAG.s:
-        if (length === 52) out.paymentSecrets += 1;
+        bech32.fromWords(data); // rejects non-zero padding
+        out.hasPaymentSecret = true;
         break;
       case TAG.h:
-        if (length === 52) out.descriptionHashes.push(bytesToHex(bech32.fromWords(data)));
+        out.descriptionHashes.push(bytesToHex(bech32.fromWords(data)));
         break;
       case TAG.d:
         out.inlineDescriptions += 1;
         break;
       case TAG.n:
-        if (length === 53) out.payees.push(bytesToHex(bech32.fromWords(data)));
+        out.payee = bytesToHex(bech32.fromWords(data));
         break;
       case TAG.x:
-        if (out.expiry !== undefined) throw new Error("duplicate expiry field");
         out.expiry = wordsToNumber(data);
         break;
       default:
@@ -172,8 +198,8 @@ function parseTaggedFields(words: number[]): TaggedFields {
 }
 
 /**
- * Verifies the invoice signature against `n` when present, otherwise recovers
- * the signing key.
+ * Verifies the invoice signature against `n` when present (low-S required, as
+ * BOLT11 demands), otherwise recovers the signing key (either S form accepted).
  *
  * @param sigBytes - 65 bytes: compact signature followed by the recovery id
  * @param digest - SHA-256 of the signed invoice bytes
@@ -181,23 +207,20 @@ function parseTaggedFields(words: number[]): TaggedFields {
  * @returns The signing public key, compressed lowercase hex
  */
 function verifySignature(sigBytes: Uint8Array, digest: Uint8Array, payeeField?: string): string {
-  if (sigBytes.length !== 65) throw new Error("invalid signature length");
   const recovery = sigBytes[64];
   if (recovery > 3) throw new Error("invalid recovery id");
-  const compact = sigBytes.slice(0, 64);
-  const signature = secp256k1.Signature.fromCompact(compact);
+  const compact = sigBytes.subarray(0, 64);
   if (payeeField !== undefined) {
-    if (!secp256k1.verify(compact, digest, hexToBytes(payeeField), { lowS: false })) {
-      throw new Error("invalid invoice signature");
-    }
+    const valid = secp256k1.verify(compact, digest, hexToBytes(payeeField), {
+      lowS: true,
+      format: "compact",
+    });
+    if (!valid) throw new Error("invalid invoice signature");
     return payeeField;
   }
-  const recovered = signature.addRecoveryBit(recovery).recoverPublicKey(digest);
-  const key = recovered.toRawBytes(true);
-  if (!secp256k1.verify(compact, digest, key, { lowS: false })) {
-    throw new Error("invalid invoice signature");
-  }
-  return bytesToHex(key);
+  // Recovery yields the unique key for which this signature verifies.
+  const signature = secp256k1.Signature.fromCompact(compact).addRecoveryBit(recovery);
+  return signature.recoverPublicKey(digest).toHex(true);
 }
 
 /**
