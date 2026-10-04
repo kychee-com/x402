@@ -1,7 +1,12 @@
 import { encodePaymentSignatureHeader, type HTTPTransportContext } from "@x402/core/http";
-import type { PaymentRequirements, SchemePaymentRequiredContext } from "@x402/core/types";
+import { x402ResourceServer } from "@x402/core/server";
+import type {
+  FacilitatorClient,
+  PaymentRequirements,
+  SchemePaymentRequiredContext,
+} from "@x402/core/types";
 import { describe, expect, it, vi } from "vitest";
-import { LNBTC_MAINNET } from "../../src/constants";
+import { LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
 import {
   ExactLnbtcScheme,
   httpTransportBinding,
@@ -17,27 +22,52 @@ import {
   SPEC_TIME,
   httpArticle,
   makeInvoice,
+  mcpArticle,
   payloadFor,
   requirementsFor,
 } from "./helpers";
 
-const receiverReturning = (invoice = SPEC_INVOICE) => {
+const RESOURCE = "https://api.example.com/article/A";
+
+const receiverReturning = (invoice: unknown = SPEC_INVOICE) => {
   const receiver: LightningReceiver = {
-    createInvoice: vi.fn(async (_params: CreateInvoiceParams) => invoice),
+    createInvoice: vi.fn(async (_params: CreateInvoiceParams) => invoice as string),
   };
   return receiver;
 };
 
-const server = (receiver = receiverReturning(), allowInvoice?: () => boolean) =>
+// Issues a distinct, valid invoice per call, with the currency of the network.
+const freshReceiver = () => {
+  let n = 0;
+  const receiver: LightningReceiver = {
+    createInvoice: vi.fn(async (params: CreateInvoiceParams) => {
+      n += 1;
+      return makeInvoice({
+        currency: params.network === LNBTC_TESTNET ? "tb" : "bc",
+        amountMsat: params.amountMsat,
+        preimage: n.toString(16).padStart(64, "0"),
+      }).invoice;
+    }),
+  };
+  return receiver;
+};
+
+const server = (
+  receiver: LightningReceiver = receiverReturning(),
+  allowInvoice?: (transportContext: unknown) => boolean | Promise<boolean>,
+  binding = httpArticle(),
+) =>
   new ExactLnbtcScheme({
     receiver,
-    requestBinding: () => httpArticle(),
+    requestBinding: () => binding,
     allowInvoice,
     clock: () => SPEC_TIME,
   });
 
-const base = (): PaymentRequirements => {
+const base = (network: string = LNBTC_MAINNET, amount = "25000"): PaymentRequirements => {
   const r = requirementsFor();
+  r.network = network;
+  r.amount = amount;
   r.extra = { assetTransferMethod: "bolt11", paymentFlow: "upfront" };
   return r;
 };
@@ -45,10 +75,17 @@ const base = (): PaymentRequirements => {
 const ctx = (overrides: Partial<SchemePaymentRequiredContext> = {}): SchemePaymentRequiredContext =>
   ({
     requirements: [base()],
-    resourceInfo: { url: "https://api.example.com/article/A" },
+    resourceInfo: { url: RESOURCE },
     paymentRequiredResponse: { x402Version: 2, resource: { url: "" }, accepts: [] },
     ...overrides,
   }) as SchemePaymentRequiredContext;
+
+const headerContext = (header: string) =>
+  ({
+    request: {
+      adapter: { getHeader: (name: string) => (name === "payment-signature" ? header : undefined) },
+    },
+  }) as unknown as HTTPTransportContext;
 
 describe("parsePrice", () => {
   const s = server();
@@ -59,25 +96,52 @@ describe("parsePrice", () => {
     ["21.5 sats", "21500"],
     ["0.001 sat", "1"],
     ["1.2340 sats", "1234"],
+    ["021 sats", "21000"],
+    ["99999999999999999999 sats", "99999999999999999999000"],
   ])("converts %o to %s msat", async (price, msat) => {
     expect(await s.parsePrice(price, LNBTC_MAINNET)).toEqual({ asset: "BTC", amount: msat });
   });
 
-  it.each(["21", 21, "$1", "1 USD", "0.0001 BTC", "0.0001 sat", "-1 sats", "0 sats"])(
-    "rejects %o without a registered parser",
-    async price => {
-      await expect(s.parsePrice(price, LNBTC_MAINNET)).rejects.toThrow();
-    },
-  );
+  it.each([
+    "21",
+    21,
+    "$1",
+    "1 USD",
+    "0.0001 BTC",
+    "0.0001 sat",
+    "-1 sats",
+    "0 sats",
+    "0.000 sats",
+    "21 Sats",
+    "21sats",
+    "1e3 sats",
+    " 21 sats",
+    "21. sats",
+  ])("rejects %o without a registered parser", async price => {
+    await expect(s.parsePrice(price, LNBTC_MAINNET)).rejects.toThrow();
+  });
+
+  it("points callers at an explicit AssetAmount", async () => {
+    await expect(s.parsePrice("21", LNBTC_MAINNET)).rejects.toThrow(
+      /explicit AssetAmount \{ asset: "BTC", amount: "<millisatoshis>" \}/,
+    );
+  });
 
   it("rejects wrong assets, bad amounts, and unsupported networks", async () => {
     await expect(s.parsePrice({ asset: "USDC", amount: "1" }, LNBTC_MAINNET)).rejects.toThrow(
       "invalid_exact_lnbtc_asset",
     );
-    await expect(s.parsePrice({ asset: "BTC", amount: "1.5" }, LNBTC_MAINNET)).rejects.toThrow(
-      "invalid_exact_lnbtc_amount",
-    );
-    await expect(s.parsePrice("1 sat", "eip155:8453")).rejects.toThrow("unsupported_network");
+    for (const amount of ["1.5", "0", "01", 21000]) {
+      await expect(
+        s.parsePrice({ asset: "BTC", amount } as never, LNBTC_MAINNET),
+        String(amount),
+      ).rejects.toThrow("invalid_exact_lnbtc_amount");
+    }
+    for (const network of ["eip155:8453", "constructor", "toString", "__proto__"]) {
+      await expect(s.parsePrice("1 sat", network as never), network).rejects.toThrow(
+        "unsupported_network",
+      );
+    }
   });
 
   it("uses registered conversions for other forms", async () => {
@@ -89,6 +153,10 @@ describe("parsePrice", () => {
       amount: "1500000",
     });
     await expect(converted.parsePrice("$2", LNBTC_MAINNET)).rejects.toThrow();
+    const sloppy = server().registerMoneyParser(async () => ({ asset: "BTC", amount: "0.5" }));
+    await expect(sloppy.parsePrice("$1", LNBTC_MAINNET)).rejects.toThrow(
+      "invalid_exact_lnbtc_amount",
+    );
   });
 });
 
@@ -118,62 +186,250 @@ describe("requirements and challenges", () => {
     });
   });
 
-  it("reuses the accepted invoice on a paid retry instead of issuing one", async () => {
-    const receiver = receiverReturning(makeInvoice({ preimage: "ff".repeat(32) }).invoice);
-    const header = encodePaymentSignatureHeader(payloadFor());
-    const transportContext = {
-      request: { paymentHeader: header },
-    } as unknown as HTTPTransportContext;
-    const [r] = await server(receiver).enrichPaymentRequiredResponse(ctx({ transportContext }));
-    expect(r.extra.invoice).toBe(SPEC_INVOICE);
+  it("takes the request hash from the request, never from a paid retry's echo", async () => {
+    // The client echoes article B's binding, but the request is for article A.
+    const echoed = payloadFor(requirementsFor(httpArticle("B")));
+    const [r] = await server().enrichPaymentRequiredResponse(
+      ctx({ transportContext: headerContext(encodePaymentSignatureHeader(echoed)) }),
+    );
     expect(r.extra.requestHash).toBe(HTTP_A_HASH);
-    expect(receiver.createInvoice).not.toHaveBeenCalled();
-
-    const meta = { meta: { "x402/payment": payloadFor() } };
-    await server(receiver).enrichPaymentRequiredResponse(ctx({ transportContext: meta }));
-    await server(receiver).enrichPaymentRequiredResponse(ctx({ paymentPayload: payloadFor() }));
-    expect(receiver.createInvoice).not.toHaveBeenCalled();
+    expect(r.extra.requestBindingParams).toEqual({ headers: [] });
   });
 
-  it("issues a fresh invoice when reporting an error or given a malformed header", async () => {
-    const receiver = receiverReturning();
-    await server(receiver).enrichPaymentRequiredResponse(
-      ctx({ paymentPayload: payloadFor(), error: "No matching payment requirements" }),
+  describe("paid retry (payment present, no error)", () => {
+    it.each([
+      [
+        "PAYMENT-SIGNATURE header",
+        { transportContext: headerContext(encodePaymentSignatureHeader(payloadFor())) },
+      ],
+      [
+        "paymentHeader on the request context",
+        {
+          transportContext: {
+            request: { paymentHeader: encodePaymentSignatureHeader(payloadFor()) },
+          },
+        },
+      ],
+      ["MCP _meta", { transportContext: { meta: { "x402/payment": payloadFor() } } }],
+      ["core payload", { paymentPayload: payloadFor() }],
+    ])("reuses the accepted invoice from the %s without issuing", async (_name, overrides) => {
+      const receiver = freshReceiver();
+      const [r] = await server(receiver).enrichPaymentRequiredResponse(ctx(overrides as never));
+      expect(r.extra.invoice).toBe(SPEC_INVOICE);
+      expect(r.extra.requestHash).toBe(HTTP_A_HASH);
+      expect(receiver.createInvoice).not.toHaveBeenCalled();
+    });
+
+    it("never issues for a payment on another scheme or network", async () => {
+      const receiver = freshReceiver();
+      const evm = payloadFor({ ...requirementsFor(), network: "eip155:8453" });
+      const testnet = payloadFor({ ...requirementsFor(), network: LNBTC_TESTNET });
+      const upto = payloadFor({ ...requirementsFor(), scheme: "upto" });
+      for (const payload of [evm, testnet, upto]) {
+        const [r] = await server(receiver).enrichPaymentRequiredResponse(
+          ctx({ paymentPayload: payload }),
+        );
+        expect(r.extra.invoice).toBeUndefined();
+        expect(r.extra.requestHash).toBe(HTTP_A_HASH);
+      }
+      const noInvoice = payloadFor();
+      delete noInvoice.accepted.extra.invoice;
+      const [r] = await server(receiver).enrichPaymentRequiredResponse(
+        ctx({ paymentPayload: noInvoice }),
+      );
+      expect(r.extra.invoice).toBeUndefined();
+      expect(receiver.createInvoice).not.toHaveBeenCalled();
+    });
+
+    it("issues fresh invoices when an error is reported or no payload is readable", async () => {
+      const receiver = freshReceiver();
+      await server(receiver).enrichPaymentRequiredResponse(
+        ctx({ paymentPayload: payloadFor(), error: "No matching payment requirements" }),
+      );
+      await server(receiver).enrichPaymentRequiredResponse(
+        ctx({ transportContext: headerContext("!!") }),
+      );
+      await server(receiver).enrichPaymentRequiredResponse(ctx({ transportContext: { meta: {} } }));
+      expect(receiver.createInvoice).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  it("binds one requirement per call, in order, and stops once all are bound", async () => {
+    const receiver = freshReceiver();
+    const s = server(receiver);
+    const first = await s.enrichPaymentRequiredResponse(
+      ctx({ requirements: [base(), base(LNBTC_TESTNET)] }),
     );
-    const transportContext = { request: { paymentHeader: "!!" } };
-    await server(receiver).enrichPaymentRequiredResponse(ctx({ transportContext }));
+    expect(first.map(r => r.extra.requestHash)).toEqual([HTTP_A_HASH, undefined]);
+    const second = await s.enrichPaymentRequiredResponse(ctx({ requirements: first }));
+    expect(second[0]).toBe(first[0]);
+    expect(second[1].extra.requestHash).toBe(HTTP_A_HASH);
+    expect(await s.enrichPaymentRequiredResponse(ctx({ requirements: second }))).toBe(second);
     expect(receiver.createInvoice).toHaveBeenCalledTimes(2);
   });
 
-  it("passes through requirements of other schemes and networks", async () => {
+  it("passes through requirements of other schemes and unsupported networks", async () => {
+    const receiver = freshReceiver();
     const other = { ...base(), scheme: "upto" };
     const evm = { ...base(), network: "eip155:8453" };
-    const out = await server().enrichPaymentRequiredResponse(ctx({ requirements: [other, evm] }));
-    expect(out).toEqual([other, evm]);
+    const proto = { ...base(), network: "constructor" };
+    const reqs = [other, evm, proto] as PaymentRequirements[];
+    const out = await server(receiver).enrichPaymentRequiredResponse(ctx({ requirements: reqs }));
+    expect(out).toEqual(reqs);
+    expect(receiver.createInvoice).not.toHaveBeenCalled();
   });
 
-  it("denies issuance when the limiter refuses", async () => {
-    const receiver = receiverReturning();
+  describe("through x402ResourceServer", () => {
+    const resourceServer = (scheme: ExactLnbtcScheme) => {
+      const rs = new x402ResourceServer({} as FacilitatorClient);
+      rs.register(LNBTC_MAINNET, scheme);
+      rs.register(LNBTC_TESTNET, scheme);
+      return rs;
+    };
+
+    it("issues exactly one invoice per lnbtc accept, even when core calls the hook per accept", async () => {
+      const receiver = freshReceiver();
+      const accepts = [base(LNBTC_MAINNET), base(LNBTC_TESTNET), base(LNBTC_MAINNET, "50000")];
+      const response = await resourceServer(server(receiver)).createPaymentRequiredResponse(
+        accepts,
+        { url: RESOURCE },
+        "Payment required",
+      );
+      expect(receiver.createInvoice).toHaveBeenCalledTimes(3);
+      const invoices = response.accepts.map(r => r.extra.invoice);
+      expect(new Set(invoices).size).toBe(3);
+      expect(response.accepts.map(r => r.extra.requestHash)).toEqual([
+        HTTP_A_HASH,
+        HTTP_A_HASH,
+        HTTP_A_HASH,
+      ]);
+    });
+
+    it("computes the binding once per response", async () => {
+      const requestBinding = vi.fn(() => httpArticle());
+      const scheme = new ExactLnbtcScheme({
+        receiver: freshReceiver(),
+        requestBinding,
+        clock: () => SPEC_TIME,
+      });
+      await resourceServer(scheme).createPaymentRequiredResponse(
+        [base(LNBTC_MAINNET), base(LNBTC_TESTNET)],
+        { url: RESOURCE },
+        "Payment required",
+      );
+      expect(requestBinding).toHaveBeenCalledTimes(1);
+    });
+
+    it("works with a separate scheme instance per network", async () => {
+      const receiver = freshReceiver();
+      const rs = new x402ResourceServer({} as FacilitatorClient);
+      rs.register(LNBTC_MAINNET, server(receiver));
+      rs.register(LNBTC_TESTNET, server(receiver));
+      const response = await rs.createPaymentRequiredResponse(
+        [base(LNBTC_TESTNET), base(LNBTC_MAINNET)],
+        { url: RESOURCE },
+        "Payment required",
+      );
+      expect(response.accepts.map(r => typeof r.extra.invoice)).toEqual(["string", "string"]);
+      expect(receiver.createInvoice).toHaveBeenCalledTimes(2);
+    });
+
+    it("matches a paid retry against the accepted invoice and the recomputed binding", async () => {
+      const rs = resourceServer(server(freshReceiver()));
+      const required = await rs.createPaymentRequiredResponse(
+        [base(LNBTC_TESTNET), base(LNBTC_MAINNET)],
+        { url: RESOURCE },
+        undefined,
+        undefined,
+        headerContext(encodePaymentSignatureHeader(payloadFor())),
+      );
+      const match = rs.findMatchingRequirements(required.accepts, payloadFor());
+      expect(match?.network).toBe(LNBTC_MAINNET);
+      expect(match?.extra.invoice).toBe(SPEC_INVOICE);
+      expect(required.accepts[0].extra.invoice).toBeUndefined();
+    });
+  });
+
+  it("requires PaymentRequired.resource.url to equal the http:1 request URL", async () => {
     await expect(
-      server(receiver, () => false).enrichPaymentRequiredResponse(ctx()),
+      server().enrichPaymentRequiredResponse(
+        ctx({ resourceInfo: { url: "http://internal:8080/article/A" } }),
+      ),
+    ).rejects.toThrow("PaymentRequired.resource.url");
+    // MCP resources name the tool, not the binding URL.
+    const mcpInvoice = makeInvoice({ descriptionHash: MCP_A_HASH }).invoice;
+    const mcp = server(receiverReturning(mcpInvoice), undefined, mcpArticle());
+    const [r] = await mcp.enrichPaymentRequiredResponse(
+      ctx({ resourceInfo: { url: "mcp://tool/get_article" } }),
+    );
+    expect(r.extra.requestBindingProfile).toBe("mcp:1");
+  });
+
+  it("asks the limiter with the transport context before each new invoice", async () => {
+    const receiver = receiverReturning();
+    const allow = vi.fn(async () => false);
+    const transportContext = { meta: {} };
+    await expect(
+      server(receiver, allow).enrichPaymentRequiredResponse(ctx({ transportContext })),
     ).rejects.toThrow("exact_lnbtc_invoice_issuance_denied");
+    expect(allow).toHaveBeenCalledWith(transportContext);
     expect(receiver.createInvoice).not.toHaveBeenCalled();
+    const allowed = receiverReturning();
+    await server(allowed, async () => true).enrichPaymentRequiredResponse(ctx());
+    expect(allowed.createInvoice).toHaveBeenCalledTimes(1);
   });
 
   it.each([
     [{ key: OTHER_KEY }, "invalid_exact_lnbtc_invoice_payee_mismatch"],
     [{ descriptionHash: MCP_A_HASH }, "invalid_exact_lnbtc_invoice_request_mismatch"],
+    [{ description: "x", descriptionHash: null }, "invalid_exact_lnbtc_invoice_description"],
+    [{ currency: "tb" }, "invalid_exact_lnbtc_invoice_currency_mismatch"],
     [{ amountMsat: 1_000n }, "invalid_exact_lnbtc_invoice_amount_mismatch"],
+    [{ expiry: 3600 }, "invalid_exact_lnbtc_invoice_expiry_mismatch"],
+    [{ timestamp: SPEC_TIME + 61 }, "invalid_exact_lnbtc_invoice_created_in_future"],
+    [{ timestamp: SPEC_TIME - 300 }, "invalid_exact_lnbtc_invoice_expired"],
   ])("refuses a receiver invoice with %o", async (spec, reason) => {
     const receiver = receiverReturning(makeInvoice(spec).invoice);
     await expect(server(receiver).enrichPaymentRequiredResponse(ctx())).rejects.toThrow(reason);
   });
 
-  it("validates the payTo key before issuing", async () => {
-    const r = { ...base(), payTo: RECEIVER_PUBKEY.toUpperCase() };
+  it("accepts a receiver invoice at the creation-time skew boundary", async () => {
+    const receiver = receiverReturning(makeInvoice({ timestamp: SPEC_TIME + 60 }).invoice);
+    await expect(server(receiver).enrichPaymentRequiredResponse(ctx())).resolves.toHaveLength(1);
+  });
+
+  it.each([
+    [null, "invalid_exact_lnbtc_invoice_missing"],
+    ["", "invalid_exact_lnbtc_invoice_missing"],
+    [42, "invalid_exact_lnbtc_invoice_decode_failed"],
+    ["lnbc1garbage", "invalid_exact_lnbtc_invoice_decode_failed"],
+  ])("refuses a receiver result %o", async (invoice, reason) => {
     await expect(
-      server().enrichPaymentRequiredResponse(ctx({ requirements: [r] })),
-    ).rejects.toThrow("invalid_exact_lnbtc_pay_to_malformed");
+      server(receiverReturning(invoice)).enrichPaymentRequiredResponse(ctx()),
+    ).rejects.toThrow(reason);
+  });
+
+  it("validates the requirements before calling the limiter or the receiver", async () => {
+    const receiver = receiverReturning();
+    const allow = vi.fn(() => true);
+    for (const r of [
+      { ...base(), payTo: RECEIVER_PUBKEY.toUpperCase() },
+      { ...base(), amount: "1.5" },
+      { ...base(), maxTimeoutSeconds: 0 },
+      { ...base(), extra: { paymentFlow: "authorization" } },
+    ]) {
+      await expect(
+        server(receiver, allow).enrichPaymentRequiredResponse(ctx({ requirements: [r] })),
+      ).rejects.toThrow(/^invalid_exact_lnbtc_/);
+    }
+    expect(allow).not.toHaveBeenCalled();
+    expect(receiver.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("rejects a skew that is negative or fractional", () => {
+    const options = { receiver: receiverReturning(), requestBinding: () => httpArticle() };
+    expect(() => new ExactLnbtcScheme({ ...options, clockSkewSeconds: -1 })).toThrow(RangeError);
+    expect(() => new ExactLnbtcScheme({ ...options, clockSkewSeconds: 0.5 })).toThrow(RangeError);
   });
 });
 

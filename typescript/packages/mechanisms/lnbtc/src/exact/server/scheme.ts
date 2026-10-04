@@ -25,6 +25,7 @@ import {
 import type { Clock, LightningReceiver } from "../../types";
 import {
   checkExpiry,
+  isSupportedNetwork,
   reject,
   unixNow,
   validateInvoice,
@@ -79,6 +80,8 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
   private readonly clock: Clock;
   private readonly networks: Readonly<Record<string, string>>;
   private readonly moneyParsers: MoneyParser[] = [];
+  // One binding per PaymentRequired response, shared by the hook's per-accept calls.
+  private readonly bindings = new WeakMap<object, Promise<RequestBinding>>();
 
   /**
    * Creates the server scheme.
@@ -114,7 +117,7 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
    * @returns The amount in millisatoshis
    */
   async parsePrice(price: Price, network: Network): Promise<AssetAmount> {
-    if (!(network in this.networks)) reject(Errors.unsupportedNetwork);
+    if (!isSupportedNetwork(network, this.networks)) reject(Errors.unsupportedNetwork);
     let result: AssetAmount | null = null;
     if (typeof price === "object" && price !== null) {
       result = price;
@@ -133,7 +136,9 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
       );
     }
     if (result.asset !== ASSET) reject(Errors.asset);
-    if (!/^[1-9][0-9]*$/.test(result.amount)) reject(Errors.amount);
+    if (typeof result.amount !== "string" || !/^[1-9][0-9]*$/.test(result.amount)) {
+      reject(Errors.amount);
+    }
     return { asset: ASSET, amount: result.amount };
   }
 
@@ -162,9 +167,16 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
   }
 
   /**
-   * Binds each lnbtc requirement to the actual request. On the paid retry it
-   * reuses the client's accepted invoice instead of issuing a replacement; on
-   * a challenge it issues a fresh request-bound invoice.
+   * Binds the next unbound lnbtc requirement to the actual request.
+   *
+   * Core calls this hook once per accept, in order, and lets each call change
+   * only the accept it is processing. Every earlier lnbtc accept is bound by
+   * then, so the first unbound one (no `requestHash` yet) is the current accept.
+   *
+   * When a payment payload accompanies the request and no error is being
+   * reported, the call only prepares matching: no invoice is issued, and the
+   * accepted lnbtc invoice for this network fills the dynamic `invoice` field.
+   * Otherwise the requirement gets a fresh request-bound invoice.
    *
    * @param ctx - Payment-required context with the transport context
    * @returns The enriched requirements
@@ -172,28 +184,70 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
   readonly enrichPaymentRequiredResponse = async (
     ctx: SchemePaymentRequiredContext,
   ): Promise<PaymentRequirements[]> => {
-    const binding = await this.options.requestBinding(ctx.transportContext);
-    const acceptedInvoice = paidRetryInvoice(ctx);
-    const out: PaymentRequirements[] = [];
-    for (const requirements of ctx.requirements) {
-      if (requirements.scheme !== SCHEME || !(requirements.network in this.networks)) {
-        out.push(requirements);
-        continue;
-      }
-      const bound: PaymentRequirements = {
-        ...requirements,
-        extra: {
-          ...requirements.extra,
-          requestHash: binding.requestHash,
-          requestBindingProfile: binding.requestBindingProfile,
-          requestBindingParams: binding.requestBindingParams,
-        },
-      };
-      bound.extra.invoice = acceptedInvoice ?? (await this.issueInvoice(bound, ctx));
-      out.push(bound);
+    const index = ctx.requirements.findIndex(r => this.needsBinding(r));
+    if (index < 0) return ctx.requirements;
+
+    const binding = await this.bindingFor(ctx);
+    const requirements = ctx.requirements[index];
+    const bound: PaymentRequirements = {
+      ...requirements,
+      extra: {
+        ...requirements.extra,
+        requestHash: binding.requestHash,
+        requestBindingProfile: binding.requestBindingProfile,
+        requestBindingParams: binding.requestBindingParams,
+      },
+    };
+    const accepted = ctx.error === undefined ? paymentInContext(ctx) : undefined;
+    if (accepted === undefined) {
+      bound.extra.invoice = await this.issueInvoice(bound, ctx);
+    } else {
+      const invoice = acceptedInvoice(accepted, bound);
+      if (invoice !== undefined) bound.extra.invoice = invoice;
     }
-    return out;
+    return ctx.requirements.map((r, i) => (i === index ? bound : r));
   };
+
+  /**
+   * Whether a requirement is an lnbtc requirement that has no binding yet.
+   *
+   * @param requirements - Candidate requirement
+   * @returns Whether to bind it
+   */
+  private needsBinding(requirements: PaymentRequirements): boolean {
+    return (
+      requirements.scheme === SCHEME &&
+      isSupportedNetwork(requirements.network, this.networks) &&
+      requirements.extra?.requestHash === undefined
+    );
+  }
+
+  /**
+   * Computes the actual request's binding once per response and checks the
+   * `http:1` resource URL.
+   *
+   * @param ctx - Payment-required context
+   * @returns The binding
+   */
+  private bindingFor(ctx: SchemePaymentRequiredContext): Promise<RequestBinding> {
+    const key = ctx.paymentRequiredResponse ?? ctx;
+    let binding = this.bindings.get(key);
+    if (binding === undefined) {
+      binding = (async () => {
+        const computed = await this.options.requestBinding(ctx.transportContext);
+        if (computed.resourceUrl !== undefined && ctx.resourceInfo?.url !== computed.resourceUrl) {
+          throw new Error(
+            `lnbtc http:1 requires PaymentRequired.resource.url (${ctx.resourceInfo?.url}) to ` +
+              `equal the bound request URL (${computed.resourceUrl}): set the route's resource ` +
+              `or publicOrigin`,
+          );
+        }
+        return computed;
+      })();
+      this.bindings.set(key, binding);
+    }
+    return binding;
+  }
 
   /**
    * Issues and checks a fresh invoice for bound requirements.
@@ -230,23 +284,38 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
 }
 
 /**
- * Returns the accepted lnbtc invoice when this pass precedes settlement of a
- * paid retry: a payment header is present and no error is being reported.
+ * Returns the payment payload accompanying the request, if any: the core
+ * context's payload, the HTTP `PAYMENT-SIGNATURE` header, or the MCP
+ * `_meta["x402/payment"]` value.
  *
  * @param ctx - Payment-required context
- * @returns The accepted invoice, or undefined when a fresh one is needed
+ * @returns The payload, or undefined when the request carries none
  */
-function paidRetryInvoice(ctx: SchemePaymentRequiredContext): string | undefined {
-  if (ctx.error !== undefined) return undefined;
+function paymentInContext(ctx: SchemePaymentRequiredContext): unknown {
   const transport = ctx.transportContext as
-    | (HTTPTransportContext & { meta?: Record<string, unknown> })
+    | (Partial<HTTPTransportContext> & { meta?: Record<string, unknown> })
     | undefined;
-  const payload =
-    ctx.paymentPayload ??
-    decodeHeader(transport?.request?.paymentHeader) ??
-    (transport?.meta?.["x402/payment"] as PaymentPayload | undefined);
-  const invoice = payload?.accepted?.extra?.invoice;
-  return payload?.accepted?.scheme === SCHEME && typeof invoice === "string" && invoice.length > 0
+  const header =
+    transport?.request?.adapter?.getHeader("payment-signature") ??
+    transport?.request?.paymentHeader;
+  return ctx.paymentPayload ?? decodeHeader(header) ?? transport?.meta?.["x402/payment"];
+}
+
+/**
+ * Returns the accepted invoice when the payload accepted lnbtc `exact` on the
+ * requirement's network.
+ *
+ * @param payload - Untrusted payment payload
+ * @param requirements - The requirement being bound
+ * @returns The accepted invoice, or undefined
+ */
+function acceptedInvoice(payload: unknown, requirements: PaymentRequirements): string | undefined {
+  const accepted = (payload as Partial<PaymentPayload> | null)?.accepted;
+  const invoice = accepted?.extra?.invoice;
+  return accepted?.scheme === SCHEME &&
+    accepted.network === requirements.network &&
+    typeof invoice === "string" &&
+    invoice.length > 0
     ? invoice
     : undefined;
 }
