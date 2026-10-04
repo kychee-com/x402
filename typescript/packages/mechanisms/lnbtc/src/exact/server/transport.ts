@@ -24,10 +24,13 @@ export interface HttpTransportBindingConfig {
   ) => Uint8Array | undefined | Promise<Uint8Array | undefined>;
 }
 
-// A Host value never contains these; their presence would let the client move
-// the boundary between authority and request target in the adapter's URL.
-const UNSAFE_HOST = /[/?#@\\\s]/;
-const HOST_HEADERS = ["host", "x-forwarded-host"];
+// Adapters build their URL from these headers. A legitimate value never lets
+// the client move the boundary between scheme, authority, and request target.
+const URL_HEADER_RULES: ReadonlyArray<[string, RegExp]> = [
+  ["host", /^[^/?#@\\\s,]+$/],
+  ["x-forwarded-host", /^[^/?#@\\\s,]+$/],
+  ["x-forwarded-proto", /^[A-Za-z][A-Za-z0-9+.-]*$/],
+];
 
 /**
  * Reads raw body bytes from the adapter. A request without content hashes as
@@ -93,9 +96,10 @@ export function httpTransportBinding(config: HttpTransportBindingConfig): Server
     const context = transportContext as HTTPTransportContext | undefined;
     const adapter = context?.request?.adapter;
     if (!context || !adapter) throw new LnbtcError(Errors.requestBinding);
-    for (const name of HOST_HEADERS) {
+    for (const [name, rule] of URL_HEADER_RULES) {
       const value = adapter.getHeader(name);
-      if (value !== undefined && UNSAFE_HOST.test(value)) {
+      // Proxies may append comma-separated hops; each must be well-formed.
+      if (value !== undefined && !value.split(",").every(part => rule.test(part.trim()))) {
         throw new LnbtcError(Errors.requestBinding);
       }
     }

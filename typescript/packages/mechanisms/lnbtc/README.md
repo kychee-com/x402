@@ -64,8 +64,8 @@ server.register(
   able to create invoices with that key. A shared custodial node where other tenants can create
   invoices is not compatible: a tenant could pay its own invoice and present the preimage.
 - `publicOrigin` is the origin clients use. The `Host` header is never trusted, and a request
-  whose `Host` or `X-Forwarded-Host` could move the request target (it contains `/`, `?`, `#`,
-  `@`, `\`, or whitespace) is refused. `resource.url` must equal the bound URL (origin plus raw
+  whose `Host`, `X-Forwarded-Host`, or `X-Forwarded-Proto` could move the request target in the
+  adapter's URL is refused. `resource.url` must equal the bound URL (origin plus raw
   path and query): the server refuses to build a challenge otherwise, and clients refuse to pay.
   Behind a proxy, set the route's `resource` explicitly.
 - `boundHeaders` must list every header that affects the purchased operation, its content

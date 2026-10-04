@@ -492,6 +492,29 @@ describe("transport bindings", () => {
     expect((await http("http://x:1/article/A", { host: "x:1" })).requestHash).toBe(HTTP_A_HASH);
   });
 
+  it("refuses a forwarded protocol that would move the request target", async () => {
+    // With a trusted proxy, Express builds getUrl() from X-Forwarded-Proto, so
+    // `http://x/pay?u=https` turns a request for /article/B into /pay?u=https://...
+    const proto = "http://x/pay?u=https";
+    const url = `${proto}://api.example.com/article/B`;
+    await expect(http(url, { "x-forwarded-proto": proto })).rejects.toThrow(BINDING_ERROR);
+    await expect(http(url, { "x-forwarded-proto": `https, ${proto}` })).rejects.toThrow(
+      BINDING_ERROR,
+    );
+  });
+
+  it("accepts well-formed proxy header lists", async () => {
+    const headers = {
+      host: "api.example.com",
+      "x-forwarded-host": "api.example.com, edge.internal:8080",
+      "x-forwarded-proto": "https, http",
+    };
+    expect((await http("https://api.example.com/article/A", headers)).requestHash).toBe(
+      HTTP_A_HASH,
+    );
+    await expect(http("https://x/article/A", { host: "" })).rejects.toThrow(BINDING_ERROR);
+  });
+
   it("refuses an adapter URL whose target is not origin-form", async () => {
     for (const url of [
       "https://api.example.com/article/A#frag",
