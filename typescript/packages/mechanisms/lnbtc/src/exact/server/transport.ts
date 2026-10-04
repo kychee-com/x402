@@ -19,25 +19,33 @@ export interface HttpTransportBindingConfig {
    * specification hashes the bytes as received. Defaults to the adapter's
    * body when it is bytes (for example after `express.raw()`).
    */
-  rawBody?: (context: HTTPTransportContext) => Uint8Array | undefined;
+  rawBody?: (
+    context: HTTPTransportContext,
+  ) => Uint8Array | undefined | Promise<Uint8Array | undefined>;
 }
+
+// A Host value never contains these; their presence would let the client move
+// the boundary between authority and request target in the adapter's URL.
+const UNSAFE_HOST = /[/?#@\\\s]/;
+const HOST_HEADERS = ["host", "x-forwarded-host"];
 
 /**
  * Reads raw body bytes from the adapter. A request without content hashes as
- * empty; a body that a parser already consumed is refused, because the
+ * empty; content that a parser already consumed is refused, because the
  * original bytes are gone.
  *
  * @param context - HTTP transport context
  * @returns The body bytes
  */
-function adapterRawBody(context: HTTPTransportContext): Uint8Array {
+async function adapterRawBody(context: HTTPTransportContext): Promise<Uint8Array> {
   const adapter = context.request.adapter;
-  const body = adapter.getBody?.();
+  const body = await adapter.getBody?.();
   if (body instanceof Uint8Array) return body;
   const length = adapter.getHeader("content-length");
   const hasContent =
     adapter.getHeader("transfer-encoding") !== undefined ||
-    (length !== undefined && length.trim() !== "0");
+    (length !== undefined && !/^\s*0+\s*$/.test(length)) ||
+    !isEmptyParsedBody(body);
   if (!hasContent) return new Uint8Array();
   throw new TypeError(
     "lnbtc http:1 binding needs the raw request body bytes: mount a raw body parser " +
@@ -46,24 +54,57 @@ function adapterRawBody(context: HTTPTransportContext): Uint8Array {
 }
 
 /**
+ * Whether a parsed adapter body carries no content: absent, `null`, an empty
+ * string, or an empty plain object (some parsers default the body to `{}`).
+ *
+ * @param body - Parsed body from the adapter
+ * @returns Whether the body is empty
+ */
+function isEmptyParsedBody(body: unknown): boolean {
+  if (body === undefined || body === null || body === "") return true;
+  return (
+    typeof body === "object" &&
+    Object.getPrototypeOf(body) === Object.prototype &&
+    Object.keys(body).length === 0
+  );
+}
+
+/**
  * Builds the server's `requestBinding` for HTTP resources.
  *
  * @param config - Public origin, bound headers, and raw-body accessor
  * @returns A binding function for {@link ExactLnbtcServerOptions.requestBinding}
+ * @throws LnbtcError `invalid_exact_lnbtc_request_binding` when the configured
+ *   origin or bound headers are invalid
  */
 export function httpTransportBinding(config: HttpTransportBindingConfig): ServerRequestBinding {
   const origin = config.publicOrigin.replace(/\/+$/, "");
-  return transportContext => {
+  const boundHeaders = [...(config.boundHeaders ?? [])];
+  if (/[?#]/.test(origin)) throw new LnbtcError(Errors.requestBinding);
+  // Validates the origin and header configuration once, up front.
+  httpRequestBinding({
+    method: "GET",
+    url: `${origin}/`,
+    boundHeaders,
+    getHeader: () => undefined,
+  });
+
+  return async transportContext => {
     const context = transportContext as HTTPTransportContext | undefined;
     const adapter = context?.request?.adapter;
     if (!context || !adapter) throw new LnbtcError(Errors.requestBinding);
+    for (const name of HOST_HEADERS) {
+      const value = adapter.getHeader(name);
+      if (value !== undefined && UNSAFE_HOST.test(value)) {
+        throw new LnbtcError(Errors.requestBinding);
+      }
+    }
+    const body = config.rawBody ? await config.rawBody(context) : await adapterRawBody(context);
     return httpRequestBinding({
       method: adapter.getMethod(),
       url: origin + requestTarget(adapter.getUrl()),
-      body: config.rawBody
-        ? (config.rawBody(context) ?? new Uint8Array())
-        : adapterRawBody(context),
-      boundHeaders: config.boundHeaders ?? [],
+      body,
+      boundHeaders,
       getHeader: name => adapter.getHeader(name),
     });
   };
@@ -104,15 +145,24 @@ export function mcpTransportBinding(config: McpTransportBindingConfig): ServerRe
 }
 
 /**
- * Extracts the raw request target (path and query) from an absolute URL
- * without normalizing it.
+ * Extracts the raw request target (origin-form path and query) from the
+ * adapter's absolute URL without normalizing it. The authority ends at the
+ * first `/`, `?`, or `#`; a target that is not origin-form, or that carries a
+ * fragment, is refused rather than repaired.
  *
  * @param url - Absolute request URL
  * @returns The path and query, starting with `/`
+ * @throws LnbtcError `invalid_exact_lnbtc_request_binding` on an unusable target
  */
 function requestTarget(url: string): string {
-  const authorityStart = url.indexOf("://");
-  const pathStart = authorityStart < 0 ? -1 : url.indexOf("/", authorityStart + 3);
-  if (pathStart < 0) return "/";
-  return url.slice(pathStart).replace(/#.*$/, "");
+  const schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) throw new LnbtcError(Errors.requestBinding);
+  const rest = url.slice(schemeEnd + 3);
+  const authorityEnd = rest.search(/[/?#]/);
+  if (authorityEnd < 0) return "/";
+  const target = rest.slice(authorityEnd);
+  if (!target.startsWith("/") || target.startsWith("//") || target.includes("#")) {
+    throw new LnbtcError(Errors.requestBinding);
+  }
+  return target;
 }

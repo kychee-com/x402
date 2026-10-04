@@ -194,10 +194,33 @@ describe("transport bindings", () => {
       boundHeaders: bound,
       rawBody: () => body,
     })({ request: { adapter: adapter(url, headers) } });
+  const BINDING_ERROR = "invalid_exact_lnbtc_request_binding";
 
   it("uses the configured origin, never the Host header", async () => {
     expect((await http("http://evil.example:8080/article/A")).requestHash).toBe(HTTP_A_HASH);
-    expect((await http("https://api.example.com/article/A#frag")).requestHash).toBe(HTTP_A_HASH);
+    expect((await http("http://[::1]:8080/article/A")).requestHash).toBe(HTTP_A_HASH);
+  });
+
+  it("refuses a Host header that would move the request target", async () => {
+    // Express builds getUrl() as `${protocol}://${Host}${originalUrl}`: a Host of
+    // `x/article/A#` makes a request for /article/B look like /article/A.
+    for (const host of ["x/article/A#", "x/article", "x?a=", "x#", "u@x", "x\\y", "x y"]) {
+      const url = `http://${host}/article/B`;
+      await expect(http(url, { host }), host).rejects.toThrow(BINDING_ERROR);
+      await expect(http(url, { "x-forwarded-host": host }), host).rejects.toThrow(BINDING_ERROR);
+    }
+    expect((await http("http://x:1/article/A", { host: "x:1" })).requestHash).toBe(HTTP_A_HASH);
+  });
+
+  it("refuses an adapter URL whose target is not origin-form", async () => {
+    for (const url of [
+      "https://api.example.com/article/A#frag",
+      "https://api.example.com//evil/article/A",
+      "https://api.example.com?article=A",
+      "api.example.com/article/A",
+    ]) {
+      await expect(http(url), url).rejects.toThrow(BINDING_ERROR);
+    }
   });
 
   it("preserves the raw target and binds configured headers and the body", async () => {
@@ -205,34 +228,93 @@ describe("transport bindings", () => {
     const b = await http("https://x/article/A?a=1&b=2");
     expect(a.resourceUrl).toBe("https://api.example.com/article/A?b=2&a=1");
     expect(a.requestHash).not.toBe(b.requestHash);
+    expect((await http("https://x/article/%41")).resourceUrl).toBe(
+      "https://api.example.com/article/%41",
+    );
     const withHeader = await http("https://x/article/A", { accept: "text/plain" }, undefined, [
       "accept",
     ]);
     expect(withHeader.requestBindingParams).toEqual({ headers: ["accept"] });
+    expect(withHeader.requestHash).not.toBe(
+      (await http("https://x/article/A", {}, undefined, ["accept"])).requestHash,
+    );
     expect((await http("https://x/article/A", {}, Uint8Array.of(1))).requestHash).not.toBe(
       HTTP_A_HASH,
     );
     expect((await http("https://api.example.com")).resourceUrl).toBe("https://api.example.com/");
   });
 
-  it("defaults to adapter body bytes and refuses a consumed body", async () => {
+  it("accepts an asynchronous rawBody accessor", async () => {
+    const bind = httpTransportBinding({
+      publicOrigin: "https://api.example.com",
+      rawBody: async () => Uint8Array.of(0x78),
+    });
+    const expected = httpArticle("A", { body: Uint8Array.of(0x78) }).requestHash;
+    expect((await bind({ request: { adapter: adapter("https://x/article/A") } })).requestHash).toBe(
+      expected,
+    );
+  });
+
+  it("validates the configured origin and bound headers up front", () => {
+    for (const publicOrigin of [
+      "ftp://api.example.com",
+      "https://api.example.com?x=1",
+      "https://api.example.com#x",
+      "https://user@api.example.com",
+      "/relative",
+    ]) {
+      expect(() => httpTransportBinding({ publicOrigin }), publicOrigin).toThrow(BINDING_ERROR);
+    }
+    expect(() =>
+      httpTransportBinding({ publicOrigin: "https://a.example", boundHeaders: ["B", "a"] }),
+    ).toThrow(BINDING_ERROR);
+  });
+
+  describe("default body source", () => {
     const bind = httpTransportBinding({ publicOrigin: "https://api.example.com" });
     const ctxWith = (body: unknown, headers: Record<string, string> = {}) => ({
       request: { adapter: { ...adapter("https://x/article/A", headers), getBody: () => body } },
     });
-    expect((await bind(ctxWith(undefined))).requestHash).toBe(HTTP_A_HASH);
-    expect((await bind(ctxWith({}, { "content-length": "0" }))).requestHash).toBe(HTTP_A_HASH);
-    expect((await bind(ctxWith(Uint8Array.of(1)))).requestHash).not.toBe(HTTP_A_HASH);
-    expect(() => bind(ctxWith({ a: 1 }, { "content-length": "7" }))).toThrow("raw request body");
-    expect(() => bind(ctxWith({ a: 1 }, { "transfer-encoding": "chunked" }))).toThrow(
-      "raw request body",
-    );
+
+    it("hashes adapter bytes, including bytes resolved asynchronously", async () => {
+      const expected = httpArticle("A", { body: Uint8Array.of(1) }).requestHash;
+      expect((await bind(ctxWith(Uint8Array.of(1)))).requestHash).toBe(expected);
+      expect((await bind(ctxWith(Promise.resolve(Uint8Array.of(1))))).requestHash).toBe(expected);
+    });
+
+    it.each([
+      ["no getBody", undefined, {}],
+      ["undefined", undefined, {}],
+      ["null", null, {}],
+      ["empty string", "", {}],
+      ["empty object", {}, { "content-length": "0" }],
+      ["zero content-length", {}, { "content-length": " 00 " }],
+    ])("treats %s without content as an empty body", async (name, body, headers) => {
+      const ctx =
+        name === "no getBody"
+          ? { request: { adapter: adapter("https://x/article/A") } }
+          : ctxWith(body, headers as Record<string, string>);
+      expect((await bind(ctx)).requestHash).toBe(HTTP_A_HASH);
+    });
+
+    it.each([
+      ["a parsed body with content-length", { a: 1 }, { "content-length": "7" }],
+      ["a chunked body", undefined, { "transfer-encoding": "chunked" }],
+      ["a parsed body without length headers (HTTP/2)", { a: 1 }, {}],
+      ["a parsed string body", "x", {}],
+      ["a parsed array body", [], {}],
+      ["an async parsed body (Hono, Next)", Promise.resolve({ a: 1 }), {}],
+    ])("refuses %s", async (_name, body, headers) => {
+      await expect(bind(ctxWith(body, headers as Record<string, string>))).rejects.toThrow(
+        "raw request body",
+      );
+    });
   });
 
-  it("rejects a missing transport context", () => {
-    expect(() => httpTransportBinding({ publicOrigin: "https://a.example" })(undefined)).toThrow(
-      "invalid_exact_lnbtc_request_binding",
-    );
+  it("rejects a missing transport context", async () => {
+    const bind = httpTransportBinding({ publicOrigin: "https://a.example" });
+    await expect(bind(undefined)).rejects.toThrow(BINDING_ERROR);
+    await expect(bind({ request: {} })).rejects.toThrow(BINDING_ERROR);
   });
 
   it("binds MCP tool calls from the wrapper context", async () => {
@@ -240,6 +322,7 @@ describe("transport bindings", () => {
     expect((await bind({ toolName: "get_article", arguments: { article: "A" } })).requestHash).toBe(
       MCP_A_HASH,
     );
-    expect(() => bind({ arguments: {} })).toThrow("invalid_exact_lnbtc_request_binding");
+    expect(() => bind({ arguments: {} })).toThrow(BINDING_ERROR);
+    expect(() => bind(undefined)).toThrow(BINDING_ERROR);
   });
 });
