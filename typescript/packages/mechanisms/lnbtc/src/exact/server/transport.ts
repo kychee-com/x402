@@ -147,8 +147,8 @@ export function mcpTransportBinding(config: McpTransportBindingConfig): ServerRe
 /**
  * Extracts the raw request target (origin-form path and query) from the
  * adapter's absolute URL without normalizing it. The authority ends at the
- * first `/`, `?`, or `#`; a target that is not origin-form, or that carries a
- * fragment, is refused rather than repaired.
+ * first `/`, `?`, or `#`; a target that is not origin-form is refused rather
+ * than repaired, and one carrying a fragment fails URI validation.
  *
  * @param url - Absolute request URL
  * @returns The path and query, starting with `/`
@@ -161,7 +161,8 @@ function requestTarget(url: string): string {
   const authorityEnd = rest.search(/[/?#]/);
   if (authorityEnd < 0) return "/";
   const target = rest.slice(authorityEnd);
-  if (!target.startsWith("/") || target.startsWith("//") || target.includes("#")) {
+  // A fragment left in the target fails URI validation in httpRequestBinding.
+  if (!target.startsWith("/") || target.startsWith("//")) {
     throw new LnbtcError(Errors.requestBinding);
   }
   return target;
