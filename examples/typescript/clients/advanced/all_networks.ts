@@ -33,7 +33,7 @@ import { toClientKeetaSigner } from "@x402/keeta";
 import { ExactKeetaScheme } from "@x402/keeta/exact/client";
 import { decodeInvoice, httpRequestBinding } from "@x402/lnbtc";
 import { ExactLnbtcScheme } from "@x402/lnbtc/exact/client";
-import { NWCClient } from "@getalby/sdk";
+import { NWCClient, Nip47WalletError } from "@getalby/sdk";
 import {
   createClientNearSigner,
   NEAR_TESTNET_CAIP2,
@@ -246,8 +246,9 @@ async function main(): Promise<void> {
               const { preimage } = await nwc.payInvoice({ invoice });
               return { invoice, paymentHash, amountMsat, status: "paid", preimage };
             } catch (error) {
-              // A timed-out payment may still complete: report it in flight, never pay twice.
-              const inFlight = error instanceof Error && error.name.includes("Timeout");
+              // Only a wallet error response means unpaid. A timeout or relay error may still
+              // complete: report it in flight, never pay twice.
+              const inFlight = !(error instanceof Nip47WalletError);
               return {
                 invoice,
                 paymentHash,
