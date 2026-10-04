@@ -1,9 +1,13 @@
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { bytesToHex } from "@noble/hashes/utils";
 import type { PaymentCreationContext } from "@x402/core/client";
 import type { PaymentRequirements } from "@x402/core/types";
 import { describe, expect, it, vi } from "vitest";
 import { ExactLnbtcScheme } from "../../src/exact/client";
 import type { LightningPayment, LightningPayer } from "../../src/types";
 import {
+  HTTP_B_HASH,
+  OTHER_KEY,
   SPEC_INVOICE,
   SPEC_PREIMAGE,
   SPEC_TIME,
@@ -13,6 +17,7 @@ import {
   requirementsFor,
 } from "./helpers";
 
+const OTHER_PUBKEY = bytesToHex(secp256k1.getPublicKey(OTHER_KEY, true));
 const PAYMENT_HASH = "a923c2c0e4fe77061ff1cb882171f6fdf926719bb7f5ffe2e05458438c52825e";
 
 const paid = (overrides: Partial<LightningPayment> = {}): LightningPayment => ({
@@ -90,8 +95,86 @@ describe("client payment construction", () => {
     );
   });
 
+  it("pays at the expiry and creation-time boundaries and refuses just past them", async () => {
+    expect((await pay(client(paid(), httpArticle(), SPEC_TIME + 299).scheme)).payload).toEqual({
+      preimage: SPEC_PREIMAGE,
+    });
+    const atSkew = makeInvoice({ timestamp: SPEC_TIME + 60 }).invoice;
+    const { scheme } = client(paid({ invoice: atSkew }));
+    expect((await pay(scheme, requirementsFor(httpArticle(), atSkew))).payload).toBeDefined();
+  });
+
+  it.each([
+    [{ asset: "BTC " }, "invalid_exact_lnbtc_asset"],
+    [{ scheme: "upto" }, "unsupported_scheme"],
+    [{ network: "constructor" }, "unsupported_network"],
+    [{ payTo: "02" + "ff".repeat(32) }, "invalid_exact_lnbtc_pay_to_malformed"],
+    [{ maxTimeoutSeconds: 300.5 }, "invalid_exact_lnbtc_max_timeout"],
+    [{ amount: "025000" }, "invalid_exact_lnbtc_amount"],
+    [{ maxTimeoutSeconds: 600 }, "invalid_exact_lnbtc_invoice_expiry_mismatch"],
+    [{ amount: "26000" }, "invalid_exact_lnbtc_invoice_amount_mismatch"],
+    [{ payTo: OTHER_PUBKEY }, "invalid_exact_lnbtc_invoice_payee_mismatch"],
+    [
+      { extra: { ...requirementsFor().extra, assetTransferMethod: "lnurl" } },
+      "invalid_exact_lnbtc_asset_transfer_method",
+    ],
+    [
+      { extra: { ...requirementsFor().extra, requestBindingProfile: "http:2" } },
+      "invalid_exact_lnbtc_request_binding",
+    ],
+    [
+      { extra: { ...requirementsFor().extra, requestHash: HTTP_B_HASH } },
+      "invalid_exact_lnbtc_request_mismatch",
+    ],
+    [
+      { extra: { ...requirementsFor().extra, requestBindingParams: { headers: ["accept"] } } },
+      "invalid_exact_lnbtc_request_mismatch",
+    ],
+    [
+      {
+        extra: {
+          ...requirementsFor().extra,
+          invoice: makeInvoice({ description: "A", descriptionHash: null }).invoice,
+        },
+      },
+      "invalid_exact_lnbtc_invoice_description",
+    ],
+    [
+      { extra: { ...requirementsFor().extra, invoice: makeInvoice({ currency: "tb" }).invoice } },
+      "invalid_exact_lnbtc_invoice_currency_mismatch",
+    ],
+  ])("refuses %o before paying", async (patch, reason) => {
+    const { scheme, payer } = client();
+    await expect(pay(scheme, { ...requirementsFor(), ...patch })).rejects.toThrow(reason);
+    expect(payer.payInvoice).not.toHaveBeenCalled();
+  });
+
+  it("refuses an amount above the spend cap before paying", async () => {
+    const { scheme, payer } = client();
+    await expect(
+      scheme.createPaymentPayload(2, requirementsFor(), { maxAmountPerPayment: "24999" }),
+    ).rejects.toThrow("maxAmountPerPayment");
+    await expect(
+      scheme.createPaymentPayload(2, requirementsFor(), { maxAmountPerPayment: "$1" }),
+    ).rejects.toThrow("maxAmountPerPayment");
+    expect(payer.payInvoice).not.toHaveBeenCalled();
+    const capped = await scheme.createPaymentPayload(2, requirementsFor(), {
+      maxAmountPerPayment: "25000",
+    });
+    expect(capped.payload).toEqual({ preimage: SPEC_PREIMAGE });
+  });
+
   it.each([
     [{ invoice: "lnbc1other" }, "invalid_exact_lnbtc_payer_invoice_mismatch"],
+    [{ invoice: SPEC_INVOICE.toUpperCase() }, "invalid_exact_lnbtc_payer_invoice_mismatch"],
+    [{ amountMsat: 25_000 as unknown as bigint }, "invalid_exact_lnbtc_payer_amount_mismatch"],
+    [{ amountMsat: 25_100n }, "invalid_exact_lnbtc_payer_amount_mismatch"],
+    [{ preimage: "" }, "invalid_exact_lnbtc_payer_preimage_malformed"],
+    [{ preimage: null as unknown as string }, "invalid_exact_lnbtc_payer_preimage_required"],
+    [
+      { preimage: [SPEC_PREIMAGE] as unknown as string },
+      "invalid_exact_lnbtc_payer_preimage_malformed",
+    ],
     [{ paymentHash: "00".repeat(32) }, "invalid_exact_lnbtc_payer_payment_hash_mismatch"],
     [{ amountMsat: 25_001n }, "invalid_exact_lnbtc_payer_amount_mismatch"],
     [{ status: "in_flight" as const }, "exact_lnbtc_payment_in_flight"],
