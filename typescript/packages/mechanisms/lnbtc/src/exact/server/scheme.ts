@@ -344,7 +344,6 @@ function decodeHeader(header: string | undefined) {
 function satsToMsat(price: string): string {
   const [, whole, fraction = ""] = SATS_PRICE.exec(price) as RegExpExecArray;
   if (fraction.length > 3 && /[1-9]/.test(fraction.slice(3))) reject(Errors.amount);
-  const msat = BigInt(whole) * 1000n + BigInt((fraction.slice(0, 3) || "0").padEnd(3, "0"));
-  if (msat === 0n) reject(Errors.amount);
-  return msat.toString();
+  // Zero is refused by parsePrice's positive-integer check.
+  return (BigInt(whole) * 1000n + BigInt(fraction.slice(0, 3).padEnd(3, "0"))).toString();
 }

@@ -194,6 +194,20 @@ describe("parseBindingExtra and bindingsEqual", () => {
       { ...base, requestBindingParams: { headers: [], extra: 1 } },
       { ...mcpArticle(), requestBindingParams: { server: "https://a.example/mcp" } },
       { ...mcpArticle(), requestBindingParams: { server: 1, metadata: [] } },
+      {
+        ...mcpArticle(),
+        requestBindingParams: { server: "https://a.example/mcp", metadata: [], other: 1 },
+      },
+      {
+        ...mcpArticle(),
+        requestBindingParams: { server: "https://a.example/mcp", metadata: ["\ud800"] },
+      },
+      {
+        ...mcpArticle(),
+        requestBindingParams: { server: "https://a.example/mcp#x", metadata: [] },
+      },
+      { ...httpArticle(), requestBindingParams: { headers: ["payment-signature"] } },
+      { ...httpArticle(), requestBindingParams: { headers: "accept" } },
       { ...mcpArticle(), requestBindingParams: { server: "https://a.example/mcp", metadata: "" } },
     ];
     for (const extra of bad) {

@@ -117,6 +117,15 @@ describe("parsePrice", () => {
     await expect(s.parsePrice(price, LNBTC_MAINNET)).rejects.toThrow();
   });
 
+  it.each(["0 sats", "0.000 sats", "0.0001 sat", "1.0001 sats", "1.0000000001 sats"])(
+    "rejects %o as a non-positive or sub-millisatoshi amount",
+    async price => {
+      await expect(s.parsePrice(price, LNBTC_MAINNET)).rejects.toThrow(
+        "invalid_exact_lnbtc_amount",
+      );
+    },
+  );
+
   it("points callers at an explicit AssetAmount", async () => {
     await expect(s.parsePrice("21", LNBTC_MAINNET)).rejects.toThrow(
       /explicit AssetAmount \{ asset: "BTC", amount: "<millisatoshis>" \}/,

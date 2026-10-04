@@ -1,4 +1,6 @@
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
+import { hexToBytes } from "@noble/hashes/utils";
+import { bech32 } from "@scure/base";
 import { describe, expect, it, vi } from "vitest";
 import { mcpToolCallBinding } from "../../src/binding";
 import { Errors, LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
@@ -6,6 +8,7 @@ import { ExactLnbtcScheme } from "../../src/exact/facilitator";
 import { InMemoryReplayStore } from "../../src/replayStore";
 import type { ReplayStore } from "../../src/types";
 import {
+  HTTP_A_HASH,
   HTTP_B_HASH,
   OTHER_KEY,
   SPEC_PREIMAGE,
@@ -289,6 +292,11 @@ describe("core field, invoice, and preimage checks", () => {
     [{ expiry: 600 }, "invalid_exact_lnbtc_invoice_expiry_mismatch"],
     [{ timestamp: SPEC_TIME + 61 }, "invalid_exact_lnbtc_invoice_created_in_future"],
     [{ descriptionHash: null }, "invalid_exact_lnbtc_invoice_description"],
+    [{ description: "article A" }, "invalid_exact_lnbtc_invoice_description"],
+    [
+      { rawFields: [[23, bech32.toWords(hexToBytes(HTTP_A_HASH))]] },
+      "invalid_exact_lnbtc_invoice_description",
+    ],
   ])("rejects an accepted invoice with %o", async (spec, reason) => {
     const accepted = requirementsFor(httpArticle(), makeInvoice(spec).invoice);
     expect((await settle(payloadFor(accepted))).errorReason).toBe(reason);
