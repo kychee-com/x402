@@ -201,3 +201,169 @@ describe("parseBindingExtra and bindingsEqual", () => {
     }
   });
 });
+
+describe("RFC 8785 conformance", () => {
+  it("serializes the RFC 8785 number and string examples", () => {
+    // RFC 8785 section 3.2.2 example values.
+    expect(canonicalize([333333333.33333329, 1e30, 4.5, 2e-3, 0.000000000000000000000000001])).toBe(
+      "[333333333.3333333,1e+30,4.5,0.002,1e-27]",
+    );
+    expect(canonicalize('€$\u000f\nA\'B"\\\\"/')).toBe('"€$\\u000f\\nA\'B\\"\\\\\\\\\\"/"');
+    expect(canonicalize([5e-324, Number.MAX_SAFE_INTEGER + 2, -1.5e-7, 1e21, 1e20])).toBe(
+      "[5e-324,9007199254740992,-1.5e-7,1e+21,100000000000000000000]",
+    );
+  });
+
+  it("sorts members by UTF-16 code units (RFC 8785 section 3.2.3)", () => {
+    const input = {
+      "€": "Euro Sign",
+      "\r": "Carriage Return",
+      דּ: "Hebrew Letter Dalet With Dagesh",
+      "1": "One",
+      "😀": "Emoji: Grinning Face",
+      "\u0080": "Control",
+      ö: "Latin Small Letter O With Diaeresis",
+    };
+    expect(canonicalize(input)).toBe(
+      '{"\\r":"Carriage Return","1":"One","\u0080":"Control","ö":"Latin Small Letter O With Diaeresis","€":"Euro Sign","😀":"Emoji: Grinning Face","דּ":"Hebrew Letter Dalet With Dagesh"}',
+    );
+  });
+
+  it("keeps an own __proto__ member and rejects sparse arrays", () => {
+    expect(canonicalize(JSON.parse('{"__proto__":{"a":1},"b":2}'))).toBe(
+      '{"__proto__":{"a":1},"b":2}',
+    );
+    // eslint-disable-next-line no-sparse-arrays
+    expect(() => canonicalize([1, , 3])).toThrow("sparse array");
+    expect(canonicalize([[], {}, [null]])).toBe("[[],{},[null]]");
+  });
+
+  it("rejects cyclic and absurdly deep values instead of crashing the caller", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => mcp({ arguments: cyclic })).toThrow(BINDING_ERROR);
+    let deep: unknown = 1;
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    expect(() => mcp({ arguments: { deep } })).toThrow(BINDING_ERROR);
+  });
+});
+
+describe("URI syntax", () => {
+  it.each([
+    "https://api.example.com:8443/a",
+    "http://[::1]:8443/a?x[]=1&y=%41",
+    "https://api.example.com/a?q=a/b?c&d=;,:@!$'()*+",
+    "HTTPS://API.EXAMPLE.COM/A",
+  ])("accepts %s and preserves its spelling", url => {
+    expect(http({ url }).resourceUrl).toBe(url);
+  });
+
+  it("distinguishes spellings that a URL parser would normalize", () => {
+    const hashes = [
+      "https://api.example.com/article/A",
+      "https://api.example.com:443/article/A",
+      "HTTPS://api.example.com/article/A",
+      "https://api.example.com/article/./A",
+      "https://api.example.com/article/%41",
+      "https://api.example.com/article/%4a",
+      "https://api.example.com/article/%4A",
+    ].map(url => http({ url }).requestHash);
+    expect(new Set(hashes).size).toBe(hashes.length);
+  });
+
+  it.each([
+    "https:api.example.com/a",
+    "http:///a",
+    "https://?a",
+    "https://api.example.com/a b",
+    "https://api.example.com/<a>",
+    'https://api.example.com/"a"',
+    "https://api.example.com/{a}",
+    "https://api.example.com/a|b",
+    "https://api.example.com\\a",
+    "https://api.example.com/a^b",
+    "https://api.example.com/`a`",
+    "https://api.example.com/%zz",
+    "https://api.example.com/%4",
+    "https://api.example.com/é",
+    "https://api.example.com/a\n",
+    "https://:pw@api.example.com/a",
+    "https://@api.example.com/a",
+    "mailto:a@example.com",
+    "",
+  ])("rejects the http:1 URL %j", url => {
+    expect(() => http({ url })).toThrow(BINDING_ERROR);
+  });
+
+  it("accepts non-HTTP MCP server URIs but applies the same syntax rules", () => {
+    expect(mcp({ server: "urn:example:mcp-server" }).requestBindingParams.server).toBe(
+      "urn:example:mcp-server",
+    );
+    for (const server of ["https:api.example.com/mcp", "urn:a b", "urn:%zz", "x"]) {
+      expect(() => mcp({ server }), server).toThrow(BINDING_ERROR);
+    }
+  });
+});
+
+describe("binding input shapes", () => {
+  it("treats an empty list of field lines as absent and joins empty lines", () => {
+    const withHeader = (value: string | string[] | undefined) =>
+      http({ boundHeaders: ["accept"], getHeader: () => value }).requestHash;
+    expect(withHeader([])).toBe(withHeader(undefined));
+    expect(withHeader(["", ""])).not.toBe(withHeader(""));
+    expect(withHeader([" a ", "b\t"])).toBe(withHeader("a, b"));
+    expect(withHeader(["a", ""])).not.toBe(withHeader("a"));
+  });
+
+  it("rejects header values outside visible ASCII and tab", () => {
+    for (const value of ["a\r\nb", "a\u007f", "a\u0000", ["ok", "café"]]) {
+      expect(
+        () => http({ boundHeaders: ["accept"], getHeader: () => value }),
+        JSON.stringify(value),
+      ).toThrow(BINDING_ERROR);
+    }
+  });
+
+  it("requires byte bodies", () => {
+    expect(() => http({ body: "x" as unknown as Uint8Array })).toThrow(BINDING_ERROR);
+    expect(http({ body: Buffer.from("x") }).requestHash).toBe(
+      http({ body: Uint8Array.of(0x78) }).requestHash,
+    );
+  });
+
+  it("orders metadata names by UTF-16 code units and rejects lone surrogates", () => {
+    expect(
+      mcp({ boundMetadata: ["A", "a", "é", "😀", "דּ"] }).requestBindingParams.metadata,
+    ).toEqual(["A", "a", "é", "😀", "דּ"]);
+    expect(() => mcp({ boundMetadata: ["דּ", "😀"] })).toThrow(BINDING_ERROR);
+    expect(() => mcp({ boundMetadata: ["\ud800"] })).toThrow(BINDING_ERROR);
+  });
+
+  it("reads only own metadata members", () => {
+    const absent = mcp({ boundMetadata: ["__proto__", "toString"], meta: {} }).requestHash;
+    const own = mcp({
+      boundMetadata: ["__proto__", "toString"],
+      meta: JSON.parse('{"__proto__":1}'),
+    }).requestHash;
+    expect(own).not.toBe(absent);
+    // An inherited member such as Object.prototype.toString is absent.
+    expect(mcp({ boundMetadata: ["toString"], meta: {} }).requestHash).toBe(
+      mcp({ boundMetadata: ["toString"] }).requestHash,
+    );
+  });
+
+  it("rejects non-plain arguments and metadata objects", () => {
+    expect(() => mcp({ arguments: new Map() })).toThrow(BINDING_ERROR);
+    expect(() => mcp({ meta: new Date() })).toThrow(BINDING_ERROR);
+    expect(
+      mcp({ arguments: Object.assign(Object.create(null), { article: "A" }) }).requestHash,
+    ).toBe(MCP_A_HASH);
+  });
+
+  it("rejects parameter objects carrying an extra own __proto__ member", () => {
+    const params = JSON.parse('{"headers":[],"__proto__":{}}');
+    expect(() => parseBindingExtra({ ...httpArticle(), requestBindingParams: params })).toThrow(
+      BINDING_ERROR,
+    );
+  });
+});

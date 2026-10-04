@@ -19,7 +19,7 @@ export function canonicalize(value: unknown): string {
     case "string":
       return serializeString(value);
     case "object":
-      if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+      if (Array.isArray(value)) return serializeArray(value);
       return serializeObject(value as Record<string, unknown>);
     default:
       throw new TypeError(`JCS: unsupported value of type ${typeof value}`);
@@ -45,6 +45,21 @@ export function isWellFormed(value: string): boolean {
 function serializeString(value: string): string {
   if (!isWellFormed(value)) throw new TypeError("JCS: invalid Unicode string");
   return JSON.stringify(value);
+}
+
+/**
+ * Serializes an array, rejecting holes (they have no JSON value).
+ *
+ * @param value - The array to serialize
+ * @returns The canonical array text
+ */
+function serializeArray(value: unknown[]): string {
+  const items: string[] = [];
+  for (let i = 0; i < value.length; i++) {
+    if (!(i in value)) throw new TypeError("JCS: sparse array");
+    items.push(canonicalize(value[i]));
+  }
+  return `[${items.join(",")}]`;
 }
 
 /**

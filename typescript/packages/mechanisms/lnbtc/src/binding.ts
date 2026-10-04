@@ -57,6 +57,10 @@ export interface McpToolCallInput {
 const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const LOWER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/;
 const HEX64 = /^[0-9a-f]{64}$/;
+// RFC 3986 URI characters (no fragment) with well-formed percent escapes.
+// Square brackets are accepted outside the host too, as common clients send them raw.
+const URI_SYNTAX =
+  /^[A-Za-z][A-Za-z0-9+.-]*:(?:[A-Za-z0-9\-._~:/?[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2})*$/;
 const ABSENT_HASH = bytesToHex(sha256(Uint8Array.of(0x00)));
 const EXCLUDED_METADATA = new Set(["x402/payment", "progressToken"]);
 
@@ -72,6 +76,7 @@ export function httpRequestBinding(input: HttpRequestInput): RequestBinding {
   validateHttpParams(params);
   if (typeof input.method !== "string" || !TOKEN.test(input.method)) fail();
   validateAbsoluteUri(input.url, true);
+  if (input.body !== undefined && !(input.body instanceof Uint8Array)) fail();
 
   const headers = params.headers.map(name => ({
     name,
@@ -213,14 +218,15 @@ function validateSortedNames(names: unknown[], valid: (name: string) => boolean)
 }
 
 /**
- * Validates an absolute ASCII URI with no userinfo or fragment, without
- * normalizing it.
+ * Validates an absolute URI in RFC 3986 ASCII syntax with no userinfo or
+ * fragment, without normalizing it. `http` and `https` URIs need an authority
+ * with a host (`scheme://host...`).
  *
  * @param uri - Candidate URI
  * @param httpOnly - Require the `http` or `https` scheme
  */
 function validateAbsoluteUri(uri: string, httpOnly: boolean): void {
-  if (typeof uri !== "string" || !/^[\x21-\x7e]+$/.test(uri) || uri.includes("#")) fail();
+  if (typeof uri !== "string" || !URI_SYNTAX.test(uri)) fail();
   let parsed: URL;
   try {
     parsed = new URL(uri);
@@ -228,7 +234,9 @@ function validateAbsoluteUri(uri: string, httpOnly: boolean): void {
     fail();
   }
   if (parsed.username || parsed.password || /^[a-z][a-z0-9+.-]*:\/\/[^/?]*@/i.test(uri)) fail();
-  if (httpOnly && parsed.protocol !== "http:" && parsed.protocol !== "https:") fail();
+  const isHttp = parsed.protocol === "http:" || parsed.protocol === "https:";
+  if (httpOnly && !isHttp) fail();
+  if (isHttp && (!/^https?:\/\/[^/?]/i.test(uri) || parsed.hostname === "")) fail();
 }
 
 /**
@@ -238,7 +246,8 @@ function validateAbsoluteUri(uri: string, httpOnly: boolean): void {
  * @returns The value hash, lowercase hex
  */
 function headerValueHash(value: string | readonly string[] | undefined): string {
-  if (value === undefined) return ABSENT_HASH;
+  // No field lines (undefined or an empty list) means the header is absent.
+  if (value === undefined || (Array.isArray(value) && value.length === 0)) return ABSENT_HASH;
   const lines = typeof value === "string" ? [value] : value;
   const parts = lines.map(line => {
     if (typeof line !== "string" || !/^[\t\x20-\x7e]*$/.test(line)) fail();
