@@ -1,6 +1,7 @@
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { describe, expect, it, vi } from "vitest";
-import { LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
+import { mcpToolCallBinding } from "../../src/binding";
+import { Errors, LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
 import { ExactLnbtcScheme } from "../../src/exact/facilitator";
 import { InMemoryReplayStore } from "../../src/replayStore";
 import type { ReplayStore } from "../../src/types";
@@ -674,5 +675,111 @@ describe("replay store contract", () => {
     expect(
       (await settle(payloadFor(future), requirementsFor(), strict(SPEC_TIME))).errorReason,
     ).toBe("invalid_exact_lnbtc_invoice_created_in_future");
+  });
+});
+
+describe("remaining specification cases", () => {
+  it("uses the stable error strings of the specification", () => {
+    expect(Object.values(Errors).sort()).toEqual(
+      [
+        "unsupported_scheme",
+        "network_mismatch",
+        "unsupported_network",
+        "duplicate_settlement",
+        "invalid_exact_lnbtc_asset",
+        "invalid_exact_lnbtc_amount",
+        "invalid_exact_lnbtc_amount_mismatch",
+        "invalid_exact_lnbtc_pay_to_mismatch",
+        "invalid_exact_lnbtc_pay_to_malformed",
+        "invalid_exact_lnbtc_max_timeout_mismatch",
+        "invalid_exact_lnbtc_max_timeout",
+        "invalid_exact_lnbtc_extra_mismatch",
+        "invalid_exact_lnbtc_request_binding",
+        "invalid_exact_lnbtc_request_mismatch",
+        "invalid_exact_lnbtc_asset_transfer_method",
+        "invalid_exact_lnbtc_payment_flow",
+        "invalid_exact_lnbtc_invoice_missing",
+        "invalid_exact_lnbtc_invoice_decode_failed",
+        "invalid_exact_lnbtc_invoice_description",
+        "invalid_exact_lnbtc_invoice_request_mismatch",
+        "invalid_exact_lnbtc_invoice_payee_mismatch",
+        "invalid_exact_lnbtc_invoice_currency_mismatch",
+        "invalid_exact_lnbtc_invoice_amount_mismatch",
+        "invalid_exact_lnbtc_invoice_expiry_mismatch",
+        "invalid_exact_lnbtc_invoice_created_in_future",
+        "invalid_exact_lnbtc_invoice_expired",
+        "invalid_exact_lnbtc_preimage_missing",
+        "invalid_exact_lnbtc_preimage_malformed",
+        "invalid_exact_lnbtc_preimage_length",
+        "invalid_exact_lnbtc_preimage_hash_mismatch",
+        "exact_lnbtc_invoice_issuance_denied",
+        "invalid_exact_lnbtc_payer_invoice_mismatch",
+        "invalid_exact_lnbtc_payer_payment_hash_mismatch",
+        "invalid_exact_lnbtc_payer_amount_mismatch",
+        "exact_lnbtc_payment_in_flight",
+        "exact_lnbtc_payment_not_paid",
+        "invalid_exact_lnbtc_payer_preimage_required",
+        "invalid_exact_lnbtc_payer_preimage_malformed",
+        "invalid_exact_lnbtc_payer_preimage_hash_mismatch",
+      ].sort(),
+    );
+  });
+
+  it.each(["+25000", "25000.0", "2.5e4", "25_000", "25,000", "25000msat", " 25000", "-25000", ""])(
+    "rejects the amount %j on both sides",
+    async amount => {
+      const r = requirementsFor();
+      r.amount = amount;
+      expect((await settle(payloadFor(r), r)).errorReason).toBe("invalid_exact_lnbtc_amount");
+    },
+  );
+
+  it.each([
+    "lnbtc:*",
+    "lnbtc:000000000019d6689c085ae165831e93 ",
+    "LNBTC:000000000019d6689c085ae165831e93",
+  ])("requires a concrete supported network, not %j", async network => {
+    const r = requirementsFor();
+    r.network = network as never;
+    expect((await settle(payloadFor(r), r)).errorReason).toBe("unsupported_network");
+  });
+
+  it("rejects an n field naming a key other than payTo, even when it signed", async () => {
+    const accepted = requirementsFor(
+      httpArticle(),
+      makeInvoice({ key: OTHER_KEY, payeeField: true }).invoice,
+    );
+    expect((await settle(payloadFor(accepted))).errorReason).toBe(
+      "invalid_exact_lnbtc_invoice_payee_mismatch",
+    );
+  });
+
+  it("settles when the accepted MCP parameters differ only in member order", async () => {
+    const invoice = makeInvoice({ descriptionHash: mcpArticle().requestHash }).invoice;
+    const required = requirementsFor(mcpArticle(), invoice);
+    const accepted = requirementsFor(mcpArticle(), invoice);
+    accepted.extra.requestBindingParams = {
+      metadata: [],
+      server: "https://api.example.com/mcp",
+    };
+    expect((await settle(payloadFor(accepted), required)).success).toBe(true);
+  });
+
+  it("rejects a changed bound metadata value (absent to null) with an echoed digest", async () => {
+    const call = (meta?: Record<string, unknown>) =>
+      mcpToolCallBinding({
+        server: "https://api.example.com/mcp",
+        name: "get_article",
+        arguments: { article: "A" },
+        meta,
+        boundMetadata: ["tier"],
+      });
+    const invoice = makeInvoice({ descriptionHash: call({}).requestHash }).invoice;
+    const paid = requirementsFor(call({}), invoice);
+    expect((await settle(payloadFor(paid), paid)).success).toBe(true);
+    const changed = requirementsFor(call({ tier: null }), invoice);
+    expect((await settle(payloadFor(changed), changed)).errorReason).toBe(
+      "invalid_exact_lnbtc_invoice_request_mismatch",
+    );
   });
 });
