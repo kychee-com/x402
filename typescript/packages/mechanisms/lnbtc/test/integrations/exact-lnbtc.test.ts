@@ -96,15 +96,22 @@ describe.skipIf(missing)("exact lnbtc on regtest LND", () => {
   let httpServer: x402HTTPResourceServer;
 
   const article = (id: string) => `${ORIGIN}/article/${id}`;
-  // Builds getUrl() like the Express adapter: protocol, raw Host header, raw target.
-  const adapter = (path: string, headers: Record<string, string> = {}): HTTPAdapter => ({
-    getHeader: name => headers[name.toUpperCase()] ?? headers[name],
-    getMethod: () => "GET",
-    getPath: () => path,
-    getUrl: () => `http://${headers.host ?? "localhost:4021"}${path}`,
-    getAcceptHeader: () => "application/json",
-    getUserAgent: () => "lnbtc-integration",
-  });
+  // Builds getUrl() like the Express and Fastify adapters: protocol, the raw
+  // Host (or HTTP/2 :authority) header, and the raw target.
+  const adapter = (path: string, given: Record<string, string> = {}): HTTPAdapter => {
+    const headers =
+      given.host === undefined && given[":authority"] === undefined
+        ? { host: "localhost:4021", ...given }
+        : given;
+    return {
+      getHeader: name => headers[name.toUpperCase()] ?? headers[name],
+      getMethod: () => "GET",
+      getPath: () => path,
+      getUrl: () => `http://${headers.host ?? headers[":authority"]}${path}`,
+      getAcceptHeader: () => "application/json",
+      getUserAgent: () => "lnbtc-integration",
+    };
+  };
   const request = (path: string, headers?: Record<string, string>) =>
     httpServer.processHTTPRequest({ adapter: adapter(path, headers), path, method: "GET" });
 
@@ -245,6 +252,15 @@ describe.skipIf(missing)("exact lnbtc on regtest LND", () => {
     await expect(request("/article/E", { ...headers, host: "x/article/D#" })).rejects.toThrow(
       "invalid_exact_lnbtc_request_binding",
     );
+    expect((await request("/article/D", headers)).type).toBe("payment-verified");
+  });
+
+  it("refuses an HTTP/2 :authority that would move the request target", async () => {
+    const { headers } = await payFor("/article/D");
+    // The URL becomes http://x/article/D?/article/E for a request routed to /article/E.
+    await expect(
+      request("/article/E", { ...headers, ":authority": "x/article/D?" }),
+    ).rejects.toThrow("invalid_exact_lnbtc_request_binding");
     expect((await request("/article/D", headers)).type).toBe("payment-verified");
   });
 

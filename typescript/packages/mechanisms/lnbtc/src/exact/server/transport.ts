@@ -24,13 +24,15 @@ export interface HttpTransportBindingConfig {
   ) => Uint8Array | undefined | Promise<Uint8Array | undefined>;
 }
 
-// Adapters build their URL from these headers. A legitimate value never lets
-// the client move the boundary between scheme, authority, and request target.
-const URL_HEADER_RULES: ReadonlyArray<[string, RegExp]> = [
-  ["host", /^[^/?#@\\\s,]+$/],
-  ["x-forwarded-host", /^[^/?#@\\\s,]+$/],
-  ["x-forwarded-proto", /^[A-Za-z][A-Za-z0-9+.-]*$/],
-];
+// RFC 3986 authority without userinfo: host (IP-literal, IPv4address, or
+// reg-name, which also covers IPv4) and an optional port.
+const AUTHORITY =
+  /^(?:\[[0-9A-Fa-f:.]+\]|\[v[0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+\]|(?:[A-Za-z0-9\-._~!$&'()*+;=]|%[0-9A-Fa-f]{2})+)(?::[0-9]*)?$/;
+// Headers first-party adapters build the URL's authority from: Express uses
+// Host; Fastify uses Host, then :authority, or X-Forwarded-Host behind a
+// trusted proxy; Hono and Next.js parse a URL built from Host (or :authority).
+const AUTHORITY_HEADERS = ["host", ":authority", "x-forwarded-host"];
+const SCHEME_TOKEN = /^[A-Za-z][A-Za-z0-9+.-]*$/;
 
 /**
  * Reads raw body bytes from the adapter. A request without content hashes as
@@ -96,17 +98,11 @@ export function httpTransportBinding(config: HttpTransportBindingConfig): Server
     const context = transportContext as HTTPTransportContext | undefined;
     const adapter = context?.request?.adapter;
     if (!context || !adapter) throw new LnbtcError(Errors.requestBinding);
-    for (const [name, rule] of URL_HEADER_RULES) {
-      const value = adapter.getHeader(name);
-      // Proxies may append comma-separated hops; each must be well-formed.
-      if (value !== undefined && !value.split(",").every(part => rule.test(part.trim()))) {
-        throw new LnbtcError(Errors.requestBinding);
-      }
-    }
+    const target = requestTarget(adapter.getUrl(), name => adapter.getHeader(name));
     const body = config.rawBody ? await config.rawBody(context) : await adapterRawBody(context);
     return httpRequestBinding({
       method: adapter.getMethod(),
-      url: origin + requestTarget(adapter.getUrl()),
+      url: origin + target,
       body,
       boundHeaders,
       getHeader: name => adapter.getHeader(name),
@@ -150,24 +146,68 @@ export function mcpTransportBinding(config: McpTransportBindingConfig): ServerRe
 
 /**
  * Extracts the raw request target (origin-form path and query) from the
- * adapter's absolute URL without normalizing it. The authority ends at the
- * first `/`, `?`, or `#`; a target that is not origin-form is refused rather
- * than repaired, and one carrying a fragment fails URI validation.
+ * adapter's absolute URL without normalizing it.
  *
- * @param url - Absolute request URL
+ * Express and Fastify build that URL by concatenating request headers, so a
+ * header such as `Host: x/search?q=` would turn a request for `/article/B`
+ * into the target `/search?q=/article/B`. The URL alone cannot reveal this,
+ * so the authority is checked at its source: every authority header present
+ * must be a valid RFC 3986 authority, the URL's authority must equal one of
+ * them (so a request with no authority header is refused), and
+ * `X-Forwarded-Proto` must be a scheme token.
+ *
+ * @param url - Absolute request URL from the adapter
+ * @param getHeader - Request header lookup
  * @returns The path and query, starting with `/`
- * @throws LnbtcError `invalid_exact_lnbtc_request_binding` on an unusable target
+ * @throws LnbtcError `invalid_exact_lnbtc_request_binding` on an unusable URL
  */
-function requestTarget(url: string): string {
-  const schemeEnd = url.indexOf("://");
-  if (schemeEnd < 0) throw new LnbtcError(Errors.requestBinding);
-  const rest = url.slice(schemeEnd + 3);
-  const authorityEnd = rest.search(/[/?#]/);
-  if (authorityEnd < 0) return "/";
-  const target = rest.slice(authorityEnd);
-  // A fragment left in the target fails URI validation in httpRequestBinding.
-  if (!target.startsWith("/") || target.startsWith("//")) {
+function requestTarget(url: string, getHeader: (name: string) => string | undefined): string {
+  const match = /^(https?):\/\/([^/?#]*)(.*)$/i.exec(url);
+  if (!match) throw new LnbtcError(Errors.requestBinding);
+  const [, scheme, authority, rest] = match;
+
+  const forwardedProto = getHeader("x-forwarded-proto");
+  if (forwardedProto !== undefined && !hops(forwardedProto).every(p => SCHEME_TOKEN.test(p))) {
     throw new LnbtcError(Errors.requestBinding);
   }
-  return target;
+  const sources = AUTHORITY_HEADERS.flatMap(name => {
+    const value = getHeader(name);
+    return value === undefined ? [] : hops(value);
+  });
+  if (!sources.every(source => AUTHORITY.test(source))) {
+    throw new LnbtcError(Errors.requestBinding);
+  }
+  const actual = normalizeAuthority(authority, scheme);
+  if (!sources.some(source => normalizeAuthority(source, scheme) === actual)) {
+    throw new LnbtcError(Errors.requestBinding);
+  }
+
+  if (rest === "") return "/";
+  // A fragment left in the target fails URI validation in httpRequestBinding.
+  if (!rest.startsWith("/") || rest.startsWith("//")) throw new LnbtcError(Errors.requestBinding);
+  return rest;
+}
+
+/**
+ * Splits a header into its comma-separated hops, as proxies append them.
+ *
+ * @param value - Header value
+ * @returns Trimmed hops
+ */
+function hops(value: string): string[] {
+  return value.split(",").map(part => part.trim());
+}
+
+/**
+ * Normalizes an authority for comparison the way WHATWG URL parsing does for
+ * Hono and Next.js: lowercase, without the scheme's default port.
+ *
+ * @param authority - Authority text
+ * @param scheme - `http` or `https`, any case
+ * @returns The comparable authority
+ */
+function normalizeAuthority(authority: string, scheme: string): string {
+  const lower = authority.toLowerCase();
+  const defaultPort = scheme.toLowerCase() === "https" ? ":443" : ":80";
+  return lower.endsWith(defaultPort) ? lower.slice(0, -defaultPort.length) : lower;
 }

@@ -63,11 +63,14 @@ server.register(
 - `payTo` is the receiver node's compressed public key, and the server must be the only party
   able to create invoices with that key. A shared custodial node where other tenants can create
   invoices is not compatible: a tenant could pay its own invoice and present the preimage.
-- `publicOrigin` is the origin clients use. The `Host` header is never trusted, and a request
-  whose `Host`, `X-Forwarded-Host`, or `X-Forwarded-Proto` could move the request target in the
-  adapter's URL is refused. `resource.url` must equal the bound URL (origin plus raw
-  path and query): the server refuses to build a challenge otherwise, and clients refuse to pay.
-  Behind a proxy, set the route's `resource` explicitly.
+- `publicOrigin` is the origin clients use; the bound URL is it plus the raw path and query
+  from the adapter. Adapters build their URL from request headers, so the binding requires every
+  `Host`, `:authority`, and `X-Forwarded-Host` value to be a valid RFC 3986 authority, the
+  URL's authority to equal one of them, and `X-Forwarded-Proto` to be a scheme token; otherwise
+  the request is refused. The target is not cross-checked against `adapter.getPath()`, because
+  adapters disagree on that path (Hono decodes percent escapes; Next.js drops `basePath` and the
+  locale). `resource.url` must equal the bound URL: the server refuses to build a challenge
+  otherwise, and clients refuse to pay. Behind a proxy, set the route's `resource` explicitly.
 - `boundHeaders` must list every header that affects the purchased operation, its content
   interpretation, or account selection, even when absent.
 - The binding hashes the request body bytes as received, so a paid route with a body needs a

@@ -458,11 +458,18 @@ describe("requirements and challenges", () => {
 });
 
 describe("transport bindings", () => {
-  const adapter = (url: string, headers: Record<string, string> = {}, method = "GET") => ({
-    getMethod: () => method,
-    getUrl: () => url,
-    getHeader: (name: string) => headers[name],
-  });
+  // Like a first-party adapter: the Host header carries the URL's authority
+  // unless a test supplies its own authority headers.
+  const adapter = (url: string, headers: Record<string, string> = {}, method = "GET") => {
+    const own = "host" in headers || ":authority" in headers || "x-forwarded-host" in headers;
+    const host = /^[a-z]+:\/\/([^/?#]*)/i.exec(url)?.[1];
+    const all: Record<string, string> = own || host === undefined ? headers : { host, ...headers };
+    return {
+      getMethod: () => method,
+      getUrl: () => url,
+      getHeader: (name: string) => all[name],
+    };
+  };
   const http = (
     url: string,
     headers?: Record<string, string>,
@@ -490,6 +497,75 @@ describe("transport bindings", () => {
       await expect(http(url, { "x-forwarded-host": host }), host).rejects.toThrow(BINDING_ERROR);
     }
     expect((await http("http://x:1/article/A", { host: "x:1" })).requestHash).toBe(HTTP_A_HASH);
+  });
+
+  it("refuses an authority the URL took from a header it was not validated against", async () => {
+    // Host injection through a source other than Host itself (HTTP/2 :authority,
+    // or a header the binding cannot see): the URL's authority must match a
+    // validated authority header.
+    const url = "http://x/search?q=/article/B";
+    await expect(http(url, { ":authority": "x/search?q=" }), ":authority").rejects.toThrow(
+      BINDING_ERROR,
+    );
+    await expect(http(url, { host: "api.example.com" }), "mismatch").rejects.toThrow(BINDING_ERROR);
+    await expect(http("http://x/article/A?/article/B", { host: "x" })).resolves.toBeDefined();
+    const noHeaders = httpTransportBinding({ publicOrigin: "https://api.example.com" });
+    const bare = { getMethod: () => "GET", getUrl: () => url, getHeader: () => undefined };
+    await expect(noHeaders({ request: { adapter: bare } }), "no source").rejects.toThrow(
+      BINDING_ERROR,
+    );
+  });
+
+  it.each([
+    ["api.example.com", "https://api.example.com/article/A"],
+    ["API.Example.COM:443", "https://api.example.com/article/A"],
+    ["api.example.com:80", "http://api.example.com/article/A"],
+    ["api.example.com:", "http://api.example.com:/article/A"],
+    ["127.0.0.1:8080", "http://127.0.0.1:8080/article/A"],
+    ["[::1]:8080", "http://[::1]:8080/article/A"],
+    ["[v1.fe80::a+en1]", "http://[v1.fe80::a+en1]/article/A"],
+    ["xn--bcher-kva.example", "http://xn--bcher-kva.example/article/A"],
+    ["a%2Db.example", "http://a%2Db.example/article/A"],
+  ])("accepts the authority %s for %s", async (host, url) => {
+    expect((await http(url, { host })).requestHash).toBe(HTTP_A_HASH);
+  });
+
+  it.each([
+    "",
+    "a b",
+    "u@x",
+    "x:8080:1",
+    "x:port",
+    "[::1",
+    "::1",
+    "x%zz",
+    "b\u00fccher.example",
+    "x,y",
+  ])("refuses the authority header %j", async host => {
+    await expect(http(`http://${host}/article/A`, { host })).rejects.toThrow(BINDING_ERROR);
+  });
+
+  it("accepts an HTTP/2 :authority without a Host header", async () => {
+    const url = "https://api.example.com/article/A";
+    expect((await http(url, { ":authority": "api.example.com" })).requestHash).toBe(HTTP_A_HASH);
+  });
+
+  it("checks every hop of a forwarded host", async () => {
+    await expect(
+      http("http://api.example.com/article/A", {
+        host: "api.example.com",
+        "x-forwarded-host": "api.example.com, x/search?q=",
+      }),
+    ).rejects.toThrow(BINDING_ERROR);
+    // Fastify behind a trusted proxy builds the URL from X-Forwarded-Host.
+    expect(
+      (
+        await http("https://public.example/article/A", {
+          host: "10.0.0.5:3000",
+          "x-forwarded-host": "edge.example, public.example",
+        })
+      ).requestHash,
+    ).toBe(HTTP_A_HASH);
   });
 
   it("refuses a forwarded protocol that would move the request target", async () => {
