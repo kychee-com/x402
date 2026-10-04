@@ -33,7 +33,8 @@ Node credentials stay in your application. Each role takes a small adapter:
 - **Server** — `LightningReceiver.createInvoice({ amountMsat, descriptionHash, expirySeconds })`
   creates a fresh invoice with a new preimage and the given description hash.
 - **Facilitator** — `ReplayStore.consume(key, retainUntil)` atomically inserts a key and returns
-  `false` if it already exists. It must survive restarts and be shared by every instance that
+  `true` only when it inserted it (`false` if it already exists; any other result counts as a
+  duplicate, and a thrown error fails the settlement). It must survive restarts and be shared by every instance that
   settles for the same receiver (for example a table with a unique key). `InMemoryReplayStore`
   is for tests only.
 
@@ -62,21 +63,31 @@ server.register(
 - `payTo` is the receiver node's compressed public key, and the server must be the only party
   able to create invoices with that key. A shared custodial node where other tenants can create
   invoices is not compatible: a tenant could pay its own invoice and present the preimage.
-- `publicOrigin` is the origin clients use. The `Host` header is never trusted. Set the route's
-  `resource` to the same public URL, because clients require `resource.url` to equal the URL
-  they requested.
+- `publicOrigin` is the origin clients use. The `Host` header is never trusted, and a request
+  whose `Host` or `X-Forwarded-Host` could move the request target (it contains `/`, `?`, `#`,
+  `@`, `\`, or whitespace) is refused. `resource.url` must equal the bound URL (origin plus raw
+  path and query): the server refuses to build a challenge otherwise, and clients refuse to pay.
+  Behind a proxy, set the route's `resource` explicitly.
 - `boundHeaders` must list every header that affects the purchased operation, its content
   interpretation, or account selection, even when absent.
 - The binding hashes the request body bytes as received, so a paid route with a body needs a
   raw body parser (with Express, `express.raw({ type: "*/*" })` on the route); the adapter's
-  body is used when it is bytes. A body already parsed as JSON is refused rather than re-serialized.
-  Pass `rawBody` to read the bytes some other way.
+  body is used when it is bytes. A body already parsed (for example JSON from Hono or Next.js) is
+  refused rather than re-serialized. Pass `rawBody` (it may be async) to read the bytes some other
+  way. Without either, a request is treated as bodiless only when it has no `Content-Length` or
+  `Transfer-Encoding` and the adapter reports no body; over HTTP/2, where those headers are
+  optional, prefer `rawBody`.
 - Prices are an explicit `{ asset: "BTC", amount: "<msat>" }` or `"21 sats"`. Bare numbers and
   `$` prices are rejected unless you `registerMoneyParser` a conversion.
-- `allowInvoice` can rate-limit invoice issuance. On a paid retry the server reuses the client's
-  invoice and does not issue a new one.
+- `allowInvoice` can rate-limit invoice issuance. Each lnbtc accept gets one fresh invoice per
+  challenge. When a request carries a payment, the server issues nothing: it matches the payment
+  using the client's invoice and the binding recomputed from the request.
 
-MCP tools wrapped by `@x402/mcp` use `mcpTransportBinding({ server, boundMetadata })`.
+MCP tools wrapped by `@x402/mcp` use `mcpTransportBinding({ server, boundMetadata })`. Set the
+wrapper's `resource.url` to `mcp://tool/<name>`: the wrapper takes the bound tool name from it.
+The MCP SDK applies a tool's input-schema defaults and transformations before the wrapper sees the
+arguments, while the client binds the arguments it sent, so a paid tool whose schema adds defaults
+or strips unknown keys refuses calls that omit or add those arguments.
 
 ## Client
 
@@ -98,7 +109,8 @@ client.register(
 `requestBinding` describes the request the client intends to pay for, computed from that
 request, never from the challenge. The client refuses to pay an invoice bound to anything else,
 an invoice not signed by `payTo`, or one whose amount, currency, or expiry differs from the
-requirements. Use `mcpToolCallBinding` for MCP tool calls.
+requirements. It also refuses amounts above the client's spend cap. Use `mcpToolCallBinding` for
+MCP tool calls.
 
 ## Facilitator
 
