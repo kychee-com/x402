@@ -81,7 +81,8 @@ describe("client payment construction", () => {
     ],
   ])("refuses invalid requirements %o", async (patch, reason) => {
     const { scheme, payer } = client();
-    await expect(pay(scheme, { ...requirementsFor(), ...patch })).rejects.toThrow(reason);
+    const requirements = { ...requirementsFor(), ...patch } as PaymentRequirements;
+    await expect(pay(scheme, requirements)).rejects.toThrow(reason);
     expect(payer.payInvoice).not.toHaveBeenCalled();
   });
 
@@ -145,7 +146,8 @@ describe("client payment construction", () => {
     ],
   ])("refuses %o before paying", async (patch, reason) => {
     const { scheme, payer } = client();
-    await expect(pay(scheme, { ...requirementsFor(), ...patch })).rejects.toThrow(reason);
+    const requirements = { ...requirementsFor(), ...patch } as PaymentRequirements;
+    await expect(pay(scheme, requirements)).rejects.toThrow(reason);
     expect(payer.payInvoice).not.toHaveBeenCalled();
   });
 

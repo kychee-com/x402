@@ -1,10 +1,6 @@
 import { encodePaymentSignatureHeader, type HTTPTransportContext } from "@x402/core/http";
-import { x402ResourceServer } from "@x402/core/server";
-import type {
-  FacilitatorClient,
-  PaymentRequirements,
-  SchemePaymentRequiredContext,
-} from "@x402/core/types";
+import { type FacilitatorClient, x402ResourceServer } from "@x402/core/server";
+import type { Network, PaymentRequirements, SchemePaymentRequiredContext } from "@x402/core/types";
 import { describe, expect, it, vi } from "vitest";
 import { LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
 import {
@@ -64,7 +60,7 @@ const server = (
     clock: () => SPEC_TIME,
   });
 
-const base = (network: string = LNBTC_MAINNET, amount = "25000"): PaymentRequirements => {
+const base = (network: Network = LNBTC_MAINNET, amount = "25000"): PaymentRequirements => {
   const r = requirementsFor();
   r.network = network;
   r.amount = amount;

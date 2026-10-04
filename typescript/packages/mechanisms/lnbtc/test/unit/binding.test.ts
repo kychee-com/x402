@@ -169,9 +169,9 @@ describe("mcp:1 binding", () => {
 
 describe("parseBindingExtra and bindingsEqual", () => {
   it("accepts valid extras and compares parameters by JCS", () => {
-    const a = parseBindingExtra({ ...httpArticle(), extraField: 1 });
+    const a = parseBindingExtra({ ...httpArticle(), extraField: 1 } as Record<string, unknown>);
     expect(a.requestHash).toBe(HTTP_A_HASH);
-    const m1 = parseBindingExtra(mcpArticle());
+    const m1 = parseBindingExtra({ ...mcpArticle() });
     const m2 = parseBindingExtra({
       ...mcpArticle(),
       requestBindingParams: { metadata: [], server: "https://api.example.com/mcp" },

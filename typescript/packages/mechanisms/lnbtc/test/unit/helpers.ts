@@ -99,14 +99,10 @@ export function makeInvoice(spec: InvoiceSpec = {}): { invoice: string; paymentH
 
   const data = Uint8Array.from(scure.convertRadix2(words, 5, 8, true));
   const message = new Uint8Array([...new TextEncoder().encode(hrp), ...data]);
-  let signature = secp256k1.sign(sha256(message), key);
-  if (spec.highS) {
-    signature = new secp256k1.Signature(
-      signature.r,
-      secp256k1.CURVE.n - signature.s,
-      signature.recovery ^ 1,
-    );
-  }
+  const signed = secp256k1.sign(sha256(message), key);
+  const signature = spec.highS
+    ? new secp256k1.Signature(signed.r, secp256k1.CURVE.n - signed.s, signed.recovery ^ 1)
+    : signed;
   const sigBytes = new Uint8Array([
     ...signature.toCompactRawBytes(),
     spec.recovery ?? (signature.recovery as number),
