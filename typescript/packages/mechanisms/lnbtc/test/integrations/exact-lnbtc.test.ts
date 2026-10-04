@@ -96,11 +96,12 @@ describe.skipIf(missing)("exact lnbtc on regtest LND", () => {
   let httpServer: x402HTTPResourceServer;
 
   const article = (id: string) => `${ORIGIN}/article/${id}`;
+  // Builds getUrl() like the Express adapter: protocol, raw Host header, raw target.
   const adapter = (path: string, headers: Record<string, string> = {}): HTTPAdapter => ({
     getHeader: name => headers[name.toUpperCase()] ?? headers[name],
     getMethod: () => "GET",
     getPath: () => path,
-    getUrl: () => `http://localhost:4021${path}`,
+    getUrl: () => `http://${headers.host ?? "localhost:4021"}${path}`,
     getAcceptHeader: () => "application/json",
     getUserAgent: () => "lnbtc-integration",
   });
@@ -186,6 +187,10 @@ describe.skipIf(missing)("exact lnbtc on regtest LND", () => {
       "GET /article/C": route("C", "21.5 sats"),
       "GET /article/D": route("D", "21 sats"),
       "GET /article/E": route("E", "21 sats"),
+      "GET /article/F": {
+        ...route("F", "21 sats"),
+        accepts: [route("F", "21 sats").accepts, route("F", "22 sats").accepts],
+      },
       "GET /expensive": { ...route("X", "5000000 sats"), resource: `${ORIGIN}/expensive` },
     });
     await httpServer.initialize();
@@ -232,6 +237,33 @@ describe.skipIf(missing)("exact lnbtc on regtest LND", () => {
     const { headers } = await payFor("/article/D");
     expect((await request("/article/E", headers)).type).toBe("payment-error");
     expect((await request("/article/D", headers)).type).toBe("payment-verified");
+  });
+
+  it("refuses a Host header that would bind another route's proof, without consuming it", async () => {
+    const { headers } = await payFor("/article/D");
+    // Express would build http://x/article/D#/article/E for a request to /article/E.
+    await expect(request("/article/E", { ...headers, host: "x/article/D#" })).rejects.toThrow(
+      "invalid_exact_lnbtc_request_binding",
+    );
+    expect((await request("/article/D", headers)).type).toBe("payment-verified");
+  });
+
+  it("issues one invoice per accept and settles the one the client chose", async () => {
+    const response = await challenge("/article/F");
+    const client = clientFor(article("F"));
+    const required = client.getPaymentRequiredResponse(
+      name => response.headers[name],
+      response.body,
+    );
+    expect(required.accepts.map(r => r.amount)).toEqual(["21000", "22000"]);
+    const invoices = required.accepts.map(r => r.extra.invoice as string);
+    expect(new Set(invoices).size).toBe(2);
+    for (const [i, invoice] of invoices.entries()) {
+      expect((await decodeWithLnd(payer, invoice)).numMsat).toBe(required.accepts[i].amount);
+    }
+    const payload = await client.createPaymentPayload(required);
+    const paid = await request("/article/F", await client.encodePaymentSignatureHeader(payload));
+    expect(paid.type).toBe("payment-verified");
   });
 
   it("settles a fractional-sat price as exact millisatoshis", async () => {
