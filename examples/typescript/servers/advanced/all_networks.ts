@@ -49,6 +49,9 @@ const keetaAddress = process.env.KEETA_ADDRESS as string | undefined;
 // Lightning: payTo is the receiver node public key; NWC_URL must be able to make invoices for it.
 const lnbtcPayTo = process.env.LNBTC_PAY_TO as string | undefined;
 const lnbtcNwcUrl = process.env.LNBTC_NWC_URL as string | undefined;
+// The origin clients use to reach this server; Lightning invoices bind the request URL under it.
+const lnbtcPublicOrigin =
+  process.env.LNBTC_PUBLIC_ORIGIN || `http://localhost:${process.env.PORT || 4021}`;
 const nearAddress = process.env.NEAR_ADDRESS as string | undefined;
 const svmAddress = process.env.SVM_ADDRESS as string | undefined;
 const stellarAddress = process.env.STELLAR_ADDRESS as string | undefined;
@@ -298,11 +301,8 @@ if (lnbtcPayTo && lnbtcNwcUrl) {
             })
           ).invoice,
       },
-      // Binds each invoice to the actual request. Set the origin clients use to reach this server.
-      requestBinding: httpTransportBinding({
-        publicOrigin:
-          process.env.LNBTC_PUBLIC_ORIGIN || `http://localhost:${process.env.PORT || 4021}`,
-      }),
+      // Binds each invoice to the actual request under the public origin.
+      requestBinding: httpTransportBinding({ publicOrigin: lnbtcPublicOrigin }),
     }),
   );
 }
@@ -331,6 +331,8 @@ app.use(
     {
       "GET /weather": {
         accepts,
+        // Lightning requires resource.url to equal the bound request URL.
+        ...(lnbtcPayTo && lnbtcNwcUrl ? { resource: `${lnbtcPublicOrigin}/weather` } : {}),
         description: "Weather data",
         mimeType: "application/json",
       },
