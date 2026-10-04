@@ -233,9 +233,8 @@ describe("RFC 8785 conformance", () => {
     expect(canonicalize(JSON.parse('{"__proto__":{"a":1},"b":2}'))).toBe(
       '{"__proto__":{"a":1},"b":2}',
     );
-    // eslint-disable-next-line no-sparse-arrays
     expect(() => canonicalize([1, , 3])).toThrow("sparse array");
-    expect(canonicalize([[], {}, [null]])).toBe("[[],{},[null]]");
+    expect(canonicalize([[], {}, [null, false, true]])).toBe("[[],{},[null,false,true]]");
   });
 
   it("rejects cyclic and absurdly deep values instead of crashing the caller", () => {

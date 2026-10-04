@@ -426,6 +426,25 @@ describe("requirements and challenges", () => {
     expect(receiver.createInvoice).not.toHaveBeenCalled();
   });
 
+  it("uses the system clock by default and works without a response object", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const scheme = new ExactLnbtcScheme({
+      receiver: receiverReturning(makeInvoice({ timestamp: now }).invoice),
+      requestBinding: () => httpArticle(),
+    });
+    const [r] = await scheme.enrichPaymentRequiredResponse(
+      ctx({ paymentRequiredResponse: undefined as never }),
+    );
+    expect(r.extra.requestHash).toBe(HTTP_A_HASH);
+    const stale = new ExactLnbtcScheme({
+      receiver: receiverReturning(),
+      requestBinding: () => httpArticle(),
+    });
+    await expect(stale.enrichPaymentRequiredResponse(ctx())).rejects.toThrow(
+      "invalid_exact_lnbtc_invoice_expired",
+    );
+  });
+
   it("rejects a skew that is negative or fractional", () => {
     const options = { receiver: receiverReturning(), requestBinding: () => httpArticle() };
     expect(() => new ExactLnbtcScheme({ ...options, clockSkewSeconds: -1 })).toThrow(RangeError);

@@ -511,6 +511,27 @@ describe("validation order (specification steps 1-7)", () => {
 });
 
 describe("untrusted input shapes", () => {
+  it("propagates unexpected errors instead of mapping them to a reason", async () => {
+    const payload = payloadFor();
+    Object.defineProperty(payload.accepted, "amount", {
+      get: () => {
+        throw new Error("boom");
+      },
+    });
+    await expect(settle(payload)).rejects.toThrow("boom");
+  });
+
+  it("uses the system clock by default", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const r = requirementsFor(httpArticle(), makeInvoice({ timestamp: now }).invoice);
+    const f = new ExactLnbtcScheme({ replayStore: new InMemoryReplayStore() });
+    expect((await f.settle(payloadFor(r), r)).success).toBe(true);
+    const old = requirementsFor();
+    expect((await f.settle(payloadFor(old), old)).errorReason).toBe(
+      "invalid_exact_lnbtc_invoice_expired",
+    );
+  });
+
   it.each([
     ["a null payload", null],
     ["a payload without accepted", { x402Version: 2, payload: { preimage: SPEC_PREIMAGE } }],

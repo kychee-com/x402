@@ -187,8 +187,9 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
     const echoed = parseBindingExtra(accepted.extra);
     if (!bindingsEqual(expected, echoed)) reject(Errors.requestMismatch);
 
-    const echoedExtra: Record<string, unknown> = accepted.extra ?? {};
-    for (const [field, value] of Object.entries(requirements.extra ?? {})) {
+    // Both extras are objects here: parseBindingExtra rejected anything else.
+    const echoedExtra: Record<string, unknown> = accepted.extra;
+    for (const [field, value] of Object.entries(requirements.extra)) {
       if (SCHEME_EXTRA_FIELDS.has(field)) continue;
       if (!Object.prototype.hasOwnProperty.call(echoedExtra, field)) reject(Errors.extraMismatch);
       if (!jcsEqual(value, echoedExtra[field])) reject(Errors.extraMismatch);

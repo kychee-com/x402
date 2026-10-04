@@ -209,7 +209,33 @@ describe("client resource check hook", () => {
     });
   });
 
-  it("aborts with the binding reason when the intended request is malformed", async () => {
+  it("aborts with the binding reason when the intended request is invalid", async () => {
+    const payer: LightningPayer = { payInvoice: vi.fn() };
+    const scheme = new ExactLnbtcScheme({
+      payer,
+      requestBinding: () => httpArticle("A#fragment"),
+    });
+    const ctx = {
+      paymentRequired: { resource: { url: "x" } },
+    } as unknown as PaymentCreationContext;
+    expect(await scheme.schemeHooks.onBeforePaymentCreation!(ctx)).toEqual({
+      abort: true,
+      reason: "invalid_exact_lnbtc_request_binding",
+    });
+  });
+
+  it("uses the system clock by default", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const invoice = makeInvoice({ timestamp: now }).invoice;
+    const payer: LightningPayer = { payInvoice: vi.fn(async () => paid({ invoice })) };
+    const scheme = new ExactLnbtcScheme({ payer, requestBinding: () => httpArticle() });
+    expect((await pay(scheme, requirementsFor(httpArticle(), invoice))).payload).toEqual({
+      preimage: SPEC_PREIMAGE,
+    });
+    await expect(pay(scheme)).rejects.toThrow("invalid_exact_lnbtc_invoice_expired");
+  });
+
+  it("propagates unexpected errors from the request binding provider", async () => {
     const payer: LightningPayer = { payInvoice: vi.fn() };
     const scheme = new ExactLnbtcScheme({
       payer,
