@@ -36,7 +36,7 @@ export function validateCoreTerms(
   networks: Readonly<Record<string, string>>,
 ): void {
   if (req.scheme !== SCHEME) reject(Errors.unsupportedScheme);
-  if (!(req.network in networks)) reject(Errors.unsupportedNetwork);
+  if (!isSupportedNetwork(req.network, networks)) reject(Errors.unsupportedNetwork);
   if (req.asset !== ASSET) reject(Errors.asset);
   if (typeof req.amount !== "string" || !POSITIVE_INTEGER.test(req.amount)) reject(Errors.amount);
   if (!Number.isSafeInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0) {
@@ -51,7 +51,9 @@ export function validateCoreTerms(
  * @param extra - Requirements `extra`
  */
 export function validateMethodAndFlow(extra: Record<string, unknown> | undefined): void {
-  const method = extra?.assetTransferMethod ?? ASSET_TRANSFER_METHOD;
+  // Only an omitted method defaults; an explicit value (even null) must be "bolt11".
+  const method =
+    extra?.assetTransferMethod === undefined ? ASSET_TRANSFER_METHOD : extra.assetTransferMethod;
   if (method !== ASSET_TRANSFER_METHOD) reject(Errors.assetTransferMethod);
   if (extra?.paymentFlow !== PAYMENT_FLOW) reject(Errors.paymentFlow);
 }
@@ -81,15 +83,12 @@ export interface InvoiceCheckOptions {
   now: number;
   /** Non-negative clock-skew allowance, seconds. */
   skew: number;
-  /**
-   * `unexpired`: the invoice must not have expired at `now` (client, server).
-   * `settlement`: the paid-but-expired grace window applies (facilitator).
-   */
-  expiry: "unexpired" | "settlement";
 }
 
 /**
- * Strictly decodes an invoice and checks it against the requirements.
+ * Strictly decodes an invoice and checks it against the requirements: the
+ * facilitator's step 5, and the client and server pre-payment checks except
+ * expiry (see {@link checkExpiry}).
  *
  * @param invoice - BOLT11 invoice text
  * @param req - Requirements whose terms the invoice must match
@@ -105,7 +104,8 @@ export function validateInvoice(
   networks: Readonly<Record<string, string>>,
   options: InvoiceCheckOptions,
 ): DecodedInvoice {
-  if (typeof invoice !== "string" || invoice.length === 0) reject(Errors.invoiceMissing);
+  if (invoice === undefined || invoice === null || invoice === "") reject(Errors.invoiceMissing);
+  if (typeof invoice !== "string") reject(Errors.invoiceDecodeFailed);
   let decoded: DecodedInvoice;
   try {
     decoded = decodeInvoice(invoice);
@@ -121,11 +121,41 @@ export function validateInvoice(
   if (decoded.amountMsat !== BigInt(req.amount)) reject(Errors.invoiceAmountMismatch);
   if (decoded.expirySeconds !== req.maxTimeoutSeconds) reject(Errors.invoiceExpiryMismatch);
   if (decoded.timestamp > options.now + options.skew) reject(Errors.invoiceCreatedInFuture);
-  const end = decoded.timestamp + decoded.expirySeconds;
-  const expired =
-    options.expiry === "settlement" ? options.now > end + options.skew : options.now >= end;
-  if (expired) reject(Errors.invoiceExpired);
   return decoded;
+}
+
+/**
+ * Applies an expiry policy to a decoded invoice.
+ *
+ * @param invoice - Decoded invoice
+ * @param options - Validation time and skew
+ * @param policy - `unexpired`: the invoice must not have expired at `now`
+ *   (client, server). `settlement`: the paid-but-expired window, valid through
+ *   `invoice_end + skew` inclusive (facilitator).
+ */
+export function checkExpiry(
+  invoice: DecodedInvoice,
+  options: InvoiceCheckOptions,
+  policy: "unexpired" | "settlement",
+): void {
+  const end = invoice.timestamp + invoice.expirySeconds;
+  const expired = policy === "settlement" ? options.now > end + options.skew : options.now >= end;
+  if (expired) reject(Errors.invoiceExpired);
+}
+
+/**
+ * Checks that a network is one of the configured networks (own keys only, so
+ * names such as `constructor` never match).
+ *
+ * @param network - Candidate network
+ * @param networks - Supported networks mapped to BOLT11 currency
+ * @returns Whether the network is supported
+ */
+export function isSupportedNetwork(
+  network: unknown,
+  networks: Readonly<Record<string, string>>,
+): network is string {
+  return typeof network === "string" && Object.prototype.hasOwnProperty.call(networks, network);
 }
 
 /**

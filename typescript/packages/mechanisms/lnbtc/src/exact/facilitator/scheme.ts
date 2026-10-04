@@ -23,6 +23,8 @@ import {
 import { canonicalize } from "../../jcs";
 import type { Clock, ReplayStore } from "../../types";
 import {
+  checkExpiry,
+  isSupportedNetwork,
   reject,
   unixNow,
   validateCoreTerms,
@@ -88,7 +90,7 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
    * @returns Supported-kind extra
    */
   getExtra(network: Network): Record<string, unknown> | undefined {
-    if (!(network in this.networks)) return undefined;
+    if (!isSupportedNetwork(network, this.networks)) return undefined;
     return { assetTransferMethod: ASSET_TRANSFER_METHOD, paymentFlow: PAYMENT_FLOW };
   }
 
@@ -118,7 +120,7 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
 
   /**
    * Validates the proof in specification order, then atomically consumes
-   * `network:payment_hash`.
+   * `network:payment_hash`. A replay store error propagates: nothing settles.
    *
    * @param payload - Payment payload carrying `accepted` and the preimage
    * @param requirements - Server-computed requirements, including the expected request hash
@@ -129,32 +131,32 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
     const network = requirements.network;
-    const now = this.clock();
+    const options = { now: this.clock(), skew: this.skew };
     let key: string;
     let paymentHash: string;
     let retainUntil: number;
     try {
-      const accepted = payload.accepted;
-      matchCoreFields(accepted, requirements);
+      // Step 1, then step 2: once the core fields are equal, checking the
+      // requirements' terms covers `accepted` too.
+      const accepted = matchCoreFields(payload?.accepted, requirements);
       validateCoreTerms(requirements, this.networks);
-      validateCoreTerms(accepted, this.networks);
       const expected = this.matchExtra(accepted, requirements);
 
-      if (!isNonEmptyString(requirements.extra?.invoice)) reject(Errors.invoiceMissing);
-      if (!isNonEmptyString(accepted.extra?.invoice)) reject(Errors.invoiceMissing);
+      // Step 4: both invoices present; settlement uses the accepted one.
+      requireInvoice(requirements.extra?.invoice);
+      requireInvoice(accepted.extra?.invoice);
+
+      // Steps 5-7: invoice terms, preimage, then the paid-but-expired window.
       const invoice = validateInvoice(
         accepted.extra.invoice,
         requirements,
         expected,
         this.networks,
-        {
-          now,
-          skew: this.skew,
-          expiry: "settlement",
-        },
+        options,
       );
-
       validatePreimage(payload.payload?.preimage, invoice.paymentHash);
+      checkExpiry(invoice, options, "settlement");
+
       paymentHash = invoice.paymentHash;
       key = `${network}:${paymentHash}`;
       retainUntil =
@@ -164,7 +166,8 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
       throw error;
     }
 
-    if (!(await this.replayStore.consume(key, retainUntil))) {
+    // Only an explicit `true` counts as inserted; anything else fails closed.
+    if ((await this.replayStore.consume(key, retainUntil)) !== true) {
       return failure(Errors.duplicateSettlement, network);
     }
     return { success: true, transaction: paymentHash, network };
@@ -184,11 +187,11 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
     const echoed = parseBindingExtra(accepted.extra);
     if (!bindingsEqual(expected, echoed)) reject(Errors.requestMismatch);
 
+    const echoedExtra: Record<string, unknown> = accepted.extra ?? {};
     for (const [field, value] of Object.entries(requirements.extra ?? {})) {
       if (SCHEME_EXTRA_FIELDS.has(field)) continue;
-      if (!(field in (accepted.extra ?? {})) || !jcsEqual(value, accepted.extra[field])) {
-        reject(Errors.extraMismatch);
-      }
+      if (!Object.prototype.hasOwnProperty.call(echoedExtra, field)) reject(Errors.extraMismatch);
+      if (!jcsEqual(value, echoedExtra[field])) reject(Errors.extraMismatch);
     }
     return expected.requestHash;
   }
@@ -197,11 +200,15 @@ export class ExactLnbtcScheme implements SchemeNetworkFacilitator {
 /**
  * Step 1: the echoed core fields equal the requirements.
  *
- * @param accepted - Client-echoed requirements
+ * @param accepted - Client-echoed requirements (untrusted)
  * @param requirements - Server-computed requirements
+ * @returns The echoed requirements, known to be an object
  */
-function matchCoreFields(accepted: PaymentRequirements, requirements: PaymentRequirements): void {
-  if (!accepted) reject(Errors.unsupportedScheme);
+function matchCoreFields(
+  accepted: PaymentRequirements | undefined,
+  requirements: PaymentRequirements,
+): PaymentRequirements {
+  if (typeof accepted !== "object" || accepted === null) reject(Errors.unsupportedScheme);
   if (accepted.scheme !== requirements.scheme) reject(Errors.unsupportedScheme);
   if (accepted.network !== requirements.network) reject(Errors.networkMismatch);
   if (accepted.amount !== requirements.amount) reject(Errors.amountMismatch);
@@ -210,6 +217,16 @@ function matchCoreFields(accepted: PaymentRequirements, requirements: PaymentReq
   if (accepted.maxTimeoutSeconds !== requirements.maxTimeoutSeconds) {
     reject(Errors.maxTimeoutMismatch);
   }
+  return accepted;
+}
+
+/**
+ * Step 4: an invoice field is present (validated as BOLT11 in step 5).
+ *
+ * @param invoice - Candidate invoice field
+ */
+function requireInvoice(invoice: unknown): void {
+  if (invoice === undefined || invoice === null || invoice === "") reject(Errors.invoiceMissing);
 }
 
 /**
@@ -242,16 +259,6 @@ function jcsEqual(a: unknown, b: unknown): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * Checks for a non-empty string.
- *
- * @param value - Candidate
- * @returns Whether it is a non-empty string
- */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
 }
 
 /**

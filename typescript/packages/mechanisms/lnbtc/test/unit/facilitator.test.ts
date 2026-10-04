@@ -1,10 +1,11 @@
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LNBTC_MAINNET, LNBTC_TESTNET } from "../../src/constants";
 import { ExactLnbtcScheme } from "../../src/exact/facilitator";
 import { InMemoryReplayStore } from "../../src/replayStore";
 import type { ReplayStore } from "../../src/types";
 import {
+  HTTP_B_HASH,
   OTHER_KEY,
   SPEC_PREIMAGE,
   SPEC_TIME,
@@ -359,5 +360,298 @@ describe("paid-but-expired policy and replay keys", () => {
     expect(makeInvoice({ preimage: SPEC_PREIMAGE }).paymentHash).toBe(
       "a923c2c0e4fe77061ff1cb882171f6fdf926719bb7f5ffe2e05458438c52825e",
     );
+  });
+});
+
+describe("validation order (specification steps 1-7)", () => {
+  const reason = async (
+    mutateAccepted: (r: PaymentRequirements) => void,
+    mutateRequired: (r: PaymentRequirements) => void = () => {},
+    options: { now?: number; preimage?: string } = {},
+  ) => {
+    const accepted = requirementsFor();
+    mutateAccepted(accepted);
+    const required = requirementsFor();
+    mutateRequired(required);
+    const payload = payloadFor(accepted, options.preimage);
+    return (await settle(payload, required, facilitator(options.now))).errorReason;
+  };
+  const invoiceWith = (spec: Parameters<typeof makeInvoice>[0]) => (r: PaymentRequirements) =>
+    (r.extra.invoice = makeInvoice(spec).invoice);
+  const both = (mutate: (r: PaymentRequirements) => void) => [mutate, mutate] as const;
+
+  it.each([
+    // step 1 order: scheme, network, amount, asset, payTo, maxTimeoutSeconds
+    [
+      "scheme before network",
+      (r: PaymentRequirements) => ((r.scheme = "upto"), (r.network = LNBTC_TESTNET)),
+      "unsupported_scheme",
+    ],
+    [
+      "network before amount",
+      (r: PaymentRequirements) => ((r.network = LNBTC_TESTNET), (r.amount = "1")),
+      "network_mismatch",
+    ],
+    [
+      "amount before asset",
+      (r: PaymentRequirements) => ((r.amount = "1"), (r.asset = "SAT")),
+      "invalid_exact_lnbtc_amount_mismatch",
+    ],
+    [
+      "asset before payTo",
+      (r: PaymentRequirements) => ((r.asset = "SAT"), (r.payTo = "02" + "ab".repeat(32))),
+      "invalid_exact_lnbtc_asset",
+    ],
+    [
+      "payTo before maxTimeoutSeconds",
+      (r: PaymentRequirements) => ((r.payTo = "02" + "ab".repeat(32)), (r.maxTimeoutSeconds = 1)),
+      "invalid_exact_lnbtc_pay_to_mismatch",
+    ],
+    [
+      "a type change is a mismatch",
+      (r: PaymentRequirements) => (r.amount = 25000 as unknown as string),
+      "invalid_exact_lnbtc_amount_mismatch",
+    ],
+    [
+      "step 1 before step 3",
+      (r: PaymentRequirements) => ((r.maxTimeoutSeconds = 1), (r.extra.paymentFlow = "x")),
+      "invalid_exact_lnbtc_max_timeout_mismatch",
+    ],
+    // step 3 order: method, flow, binding syntax, binding equality, other extras
+    [
+      "method before flow",
+      (r: PaymentRequirements) => (
+        (r.extra.assetTransferMethod = "x"), (r.extra.paymentFlow = "x")
+      ),
+      "invalid_exact_lnbtc_asset_transfer_method",
+    ],
+    [
+      "flow before binding syntax",
+      (r: PaymentRequirements) => ((r.extra.paymentFlow = "x"), (r.extra.requestHash = "x")),
+      "invalid_exact_lnbtc_payment_flow",
+    ],
+    [
+      "binding syntax before binding equality",
+      (r: PaymentRequirements) => (r.extra.requestHash = HTTP_B_HASH.toUpperCase()),
+      "invalid_exact_lnbtc_request_binding",
+    ],
+    [
+      "binding equality before invoice presence",
+      (r: PaymentRequirements) => ((r.extra.requestHash = HTTP_B_HASH), (r.extra.invoice = "")),
+      "invalid_exact_lnbtc_request_mismatch",
+    ],
+    // step 4 before step 5
+    [
+      "invoice presence before decoding",
+      (r: PaymentRequirements) => delete r.extra.invoice,
+      "invalid_exact_lnbtc_invoice_missing",
+    ],
+    // step 5 order
+    [
+      "decoding before description",
+      (r: PaymentRequirements) => (r.extra.invoice = "lnbc1garbage"),
+      "invalid_exact_lnbtc_invoice_decode_failed",
+    ],
+    [
+      "description before payee",
+      invoiceWith({ descriptionHash: null, description: "x", key: OTHER_KEY }),
+      "invalid_exact_lnbtc_invoice_description",
+    ],
+    [
+      "description request hash before payee",
+      invoiceWith({ descriptionHash: HTTP_B_HASH, key: OTHER_KEY }),
+      "invalid_exact_lnbtc_invoice_request_mismatch",
+    ],
+    [
+      "payee before currency",
+      invoiceWith({ key: OTHER_KEY, currency: "tb" }),
+      "invalid_exact_lnbtc_invoice_payee_mismatch",
+    ],
+    [
+      "currency before amount",
+      invoiceWith({ currency: "tb", amountMsat: 1n }),
+      "invalid_exact_lnbtc_invoice_currency_mismatch",
+    ],
+    [
+      "amount before expiry",
+      invoiceWith({ amountMsat: 1n, expiry: 1 }),
+      "invalid_exact_lnbtc_invoice_amount_mismatch",
+    ],
+    [
+      "expiry before creation time",
+      invoiceWith({ expiry: 1, timestamp: SPEC_TIME + 61 }),
+      "invalid_exact_lnbtc_invoice_expiry_mismatch",
+    ],
+  ])("%s", async (_name, mutate, expected) => {
+    expect(await reason(mutate)).toBe(expected);
+  });
+
+  it("checks the requirement side of step 1-2 terms (step 2) before step 3", async () => {
+    expect(await reason(...both(r => ((r.amount = "0"), (r.extra.paymentFlow = "x"))))).toBe(
+      "invalid_exact_lnbtc_amount",
+    );
+  });
+
+  it("checks the creation time (step 5) before the preimage (step 6)", async () => {
+    expect(
+      await reason(invoiceWith({ timestamp: SPEC_TIME + 61 }), undefined, {
+        preimage: PREIMAGE_B,
+      }),
+    ).toBe("invalid_exact_lnbtc_invoice_created_in_future");
+  });
+
+  it("checks the preimage (step 6) before the expiry policy (step 7)", async () => {
+    expect(await reason(() => {}, undefined, { now: SPEC_TIME + 361, preimage: PREIMAGE_B })).toBe(
+      "invalid_exact_lnbtc_preimage_hash_mismatch",
+    );
+    expect(await reason(() => {}, undefined, { now: SPEC_TIME + 361 })).toBe(
+      "invalid_exact_lnbtc_invoice_expired",
+    );
+  });
+});
+
+describe("untrusted input shapes", () => {
+  it.each([
+    ["a null payload", null],
+    ["a payload without accepted", { x402Version: 2, payload: { preimage: SPEC_PREIMAGE } }],
+    ["a string accepted", { x402Version: 2, accepted: "exact", payload: {} }],
+    ["a null accepted", { x402Version: 2, accepted: null, payload: {} }],
+  ])("returns unsupported_scheme for %s", async (_name, payload) => {
+    expect((await settle(payload as unknown as PaymentPayload)).errorReason).toBe(
+      "unsupported_scheme",
+    );
+  });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "treats the inherited property %s as an unsupported network",
+    async network => {
+      const r = requirementsFor();
+      r.network = network as never;
+      expect((await settle(payloadFor(r), r)).errorReason).toBe("unsupported_network");
+      expect(facilitator().getExtra(network as never)).toBeUndefined();
+    },
+  );
+
+  it.each([null, "BOLT11", 1])(
+    "rejects an explicit asset transfer method %o on either side",
+    async method => {
+      const r = requirementsFor();
+      r.extra.assetTransferMethod = method;
+      const expected = "invalid_exact_lnbtc_asset_transfer_method";
+      expect((await settle(payloadFor(r))).errorReason).toBe(expected);
+      expect((await settle(payloadFor(), r)).errorReason).toBe(expected);
+    },
+  );
+
+  it.each([
+    [null, "invalid_exact_lnbtc_invoice_missing"],
+    [42, "invalid_exact_lnbtc_invoice_decode_failed"],
+    [["lnbc"], "invalid_exact_lnbtc_invoice_decode_failed"],
+    [{ invoice: SPEC_PREIMAGE }, "invalid_exact_lnbtc_invoice_decode_failed"],
+  ])("classifies an accepted invoice of %o", async (invoice, expected) => {
+    const accepted = requirementsFor();
+    accepted.extra.invoice = invoice;
+    expect((await settle(payloadFor(accepted))).errorReason).toBe(expected);
+  });
+
+  it.each([
+    [null, "invalid_exact_lnbtc_preimage_missing"],
+    [42, "invalid_exact_lnbtc_preimage_malformed"],
+    [[SPEC_PREIMAGE], "invalid_exact_lnbtc_preimage_malformed"],
+    [" " + SPEC_PREIMAGE.slice(1), "invalid_exact_lnbtc_preimage_malformed"],
+    ["0x" + SPEC_PREIMAGE.slice(2), "invalid_exact_lnbtc_preimage_malformed"],
+    ["", "invalid_exact_lnbtc_preimage_length"],
+    [SPEC_PREIMAGE.slice(1), "invalid_exact_lnbtc_preimage_length"],
+  ])("classifies a preimage of %o", async (preimage, expected) => {
+    const payload = payloadFor();
+    payload.payload = { preimage } as never;
+    expect((await settle(payload)).errorReason).toBe(expected);
+    const bare = payloadFor();
+    bare.payload = "x" as never;
+    expect((await settle(bare)).errorReason).toBe("invalid_exact_lnbtc_preimage_missing");
+  });
+
+  it("does not satisfy a server-declared extra from the prototype chain", async () => {
+    const required = requirementsFor();
+    Object.defineProperty(required.extra, "__proto__", {
+      value: {},
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expect((await settle(payloadFor(), required)).errorReason).toBe(
+      "invalid_exact_lnbtc_extra_mismatch",
+    );
+  });
+
+  it("compares extra values by JCS and fails closed on non-JSON values", async () => {
+    const required = requirementsFor();
+    required.extra.campaign = { a: 1, b: [1, 2] };
+    const accepted = requirementsFor();
+    accepted.extra.campaign = { b: [1, 2], a: 1 };
+    expect((await settle(payloadFor(accepted), required)).success).toBe(true);
+    const nan = requirementsFor();
+    nan.extra.campaign = Number.NaN;
+    expect((await settle(payloadFor(nan), nan)).errorReason).toBe(
+      "invalid_exact_lnbtc_extra_mismatch",
+    );
+  });
+});
+
+describe("replay store contract", () => {
+  it.each([
+    ["false", false],
+    ["undefined", undefined],
+    ["a truthy object", { rowCount: 0 }],
+    ["1", 1],
+    ["'true'", "true"],
+  ])("treats a consume result of %s as not inserted", async (_name, result) => {
+    const store = { consume: async () => result } as unknown as ReplayStore;
+    expect(
+      (await settle(payloadFor(), requirementsFor(), facilitator(SPEC_TIME, store))).errorReason,
+    ).toBe("duplicate_settlement");
+  });
+
+  it("is not consulted when validation fails", async () => {
+    const consume = vi.fn(async () => true);
+    const f = facilitator(SPEC_TIME, { consume });
+    await settle(payloadFor(), requirementsFor(httpArticle("B")), f);
+    await settle(payloadFor(requirementsFor(), PREIMAGE_B), requirementsFor(), f);
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("keys the same payment hash separately per network", async () => {
+    const store = new InMemoryReplayStore();
+    const testnet = { ...requirementsFor(), network: LNBTC_TESTNET };
+    testnet.extra = { ...testnet.extra, invoice: makeInvoice({ currency: "tb" }).invoice };
+    expect(
+      (await settle(payloadFor(), requirementsFor(), facilitator(SPEC_TIME, store))).success,
+    ).toBe(true);
+    expect(
+      (await settle(payloadFor(testnet), testnet, facilitator(SPEC_TIME, store))).success,
+    ).toBe(true);
+    expect(
+      (await settle(payloadFor(), requirementsFor(), facilitator(SPEC_TIME, store))).errorReason,
+    ).toBe("duplicate_settlement");
+  });
+
+  it("uses the configured skew for the window and the retention", async () => {
+    const calls: number[] = [];
+    const store: ReplayStore = { consume: async (_key, until) => (calls.push(until), true) };
+    const strict = (now: number) =>
+      new ExactLnbtcScheme({ replayStore: store, clock: () => now, clockSkewSeconds: 0 });
+    const end = SPEC_TIME + 300;
+    expect((await settle(payloadFor(), requirementsFor(), strict(end))).success).toBe(true);
+    expect(calls).toEqual([end + 3600]);
+    expect((await settle(payloadFor(), requirementsFor(), strict(end + 1))).errorReason).toBe(
+      "invalid_exact_lnbtc_invoice_expired",
+    );
+    const future = requirementsFor(
+      httpArticle(),
+      makeInvoice({ timestamp: SPEC_TIME + 1 }).invoice,
+    );
+    expect(
+      (await settle(payloadFor(future), requirementsFor(), strict(SPEC_TIME))).errorReason,
+    ).toBe("invalid_exact_lnbtc_invoice_created_in_future");
   });
 });

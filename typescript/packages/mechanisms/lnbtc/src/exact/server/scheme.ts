@@ -24,6 +24,7 @@ import {
 } from "../../constants";
 import type { Clock, LightningReceiver } from "../../types";
 import {
+  checkExpiry,
   reject,
   unixNow,
   validateInvoice,
@@ -215,11 +216,15 @@ export class ExactLnbtcScheme implements SchemeNetworkServer {
       expirySeconds: requirements.maxTimeoutSeconds,
       network: requirements.network,
     });
-    validateInvoice(invoice, requirements, binding.requestHash, this.networks, {
-      now: this.clock(),
-      skew: this.skew,
-      expiry: "unexpired",
-    });
+    const options = { now: this.clock(), skew: this.skew };
+    const decoded = validateInvoice(
+      invoice,
+      requirements,
+      binding.requestHash,
+      this.networks,
+      options,
+    );
+    checkExpiry(decoded, options, "unexpired");
     return invoice;
   }
 }
