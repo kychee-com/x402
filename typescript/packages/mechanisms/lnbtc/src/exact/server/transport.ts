@@ -1,4 +1,4 @@
-import type { HTTPTransportContext } from "@x402/core/http";
+import type { HTTPAdapter, HTTPTransportContext } from "@x402/core/http";
 import { httpRequestBinding, mcpToolCallBinding } from "../../binding";
 import { Errors, LnbtcError } from "../../constants";
 import type { ServerRequestBinding } from "./scheme";
@@ -98,7 +98,7 @@ export function httpTransportBinding(config: HttpTransportBindingConfig): Server
     const context = transportContext as HTTPTransportContext | undefined;
     const adapter = context?.request?.adapter;
     if (!context || !adapter) throw new LnbtcError(Errors.requestBinding);
-    const target = requestTarget(adapter.getUrl(), name => adapter.getHeader(name));
+    const target = requestTarget(adapter.getUrl(), name => authorityHeader(adapter, name));
     const body = config.rawBody ? await config.rawBody(context) : await adapterRawBody(context);
     return httpRequestBinding({
       method: adapter.getMethod(),
@@ -108,6 +108,24 @@ export function httpTransportBinding(config: HttpTransportBindingConfig): Server
       getHeader: name => adapter.getHeader(name),
     });
   };
+}
+
+/**
+ * Reads an authority header. Fetch-based adapters (Hono, Next) back `getHeader`
+ * with WHATWG `Headers`, whose `get` throws on HTTP/2 pseudo-header names such
+ * as `:authority`; that header cannot be present there, so it reads as absent.
+ *
+ * @param adapter - HTTP adapter
+ * @param name - Lowercase header name
+ * @returns The header value, or undefined
+ */
+function authorityHeader(adapter: HTTPAdapter, name: string): string | undefined {
+  if (!name.startsWith(":")) return adapter.getHeader(name);
+  try {
+    return adapter.getHeader(name);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -129,16 +147,29 @@ export interface McpTransportBindingConfig {
 export function mcpTransportBinding(config: McpTransportBindingConfig): ServerRequestBinding {
   return transportContext => {
     const context = transportContext as
-      | { toolName?: unknown; arguments?: unknown; meta?: unknown }
+      | {
+          toolName?: unknown;
+          arguments?: unknown;
+          meta?: unknown;
+          rawToolCall?: { name?: unknown; arguments?: unknown; _meta?: unknown };
+        }
       | undefined;
-    if (!context || typeof context.toolName !== "string") {
+    // `@x402/mcp` servers that call `captureRawToolCalls` supply the call as
+    // received; the spec binds arguments before schema defaults. Without it,
+    // the validated arguments are bound, and a schema that adds defaults makes
+    // the client refuse to pay (it never makes a wrong proof acceptable).
+    const raw = context?.rawToolCall;
+    const call = raw
+      ? { name: raw.name, arguments: raw.arguments, meta: raw._meta }
+      : { name: context?.toolName, arguments: context?.arguments, meta: context?.meta };
+    if (typeof call.name !== "string") {
       throw new LnbtcError(Errors.requestBinding);
     }
     return mcpToolCallBinding({
       server: config.server,
-      name: context.toolName,
-      arguments: context.arguments,
-      meta: context.meta,
+      name: call.name,
+      arguments: call.arguments,
+      meta: call.meta,
       boundMetadata: config.boundMetadata ?? [],
     });
   };

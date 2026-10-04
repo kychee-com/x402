@@ -704,4 +704,77 @@ describe("transport bindings", () => {
     expect(() => bind({ arguments: {} })).toThrow(BINDING_ERROR);
     expect(() => bind(undefined)).toThrow(BINDING_ERROR);
   });
+
+  it("binds the raw tool call when @x402/mcp captured it, before schema defaults", async () => {
+    const bind = mcpTransportBinding({ server: "https://api.example.com/mcp" });
+    const validated = { article: "A", lang: "en" };
+    const raw = await bind({
+      toolName: "paid_tool",
+      arguments: validated,
+      rawToolCall: { name: "get_article", arguments: { article: "A" } },
+    });
+    expect(raw.requestHash).toBe(MCP_A_HASH);
+    const fallback = await bind({ toolName: "get_article", arguments: validated });
+    expect(fallback.requestHash).not.toBe(MCP_A_HASH);
+    const omitted = await bind({
+      toolName: "x",
+      arguments: {},
+      rawToolCall: { name: "get_article" },
+    });
+    expect(omitted.requestHash).toBe(
+      (await bind({ toolName: "get_article", arguments: {} })).requestHash,
+    );
+    const withMeta = await bind({
+      toolName: "get_article",
+      arguments: { article: "A" },
+      meta: { tier: "validated" },
+      rawToolCall: { name: "get_article", arguments: { article: "A" }, _meta: { tier: "raw" } },
+    });
+    const bound = mcpTransportBinding({
+      server: "https://api.example.com/mcp",
+      boundMetadata: ["tier"],
+    });
+    expect(
+      (
+        await bound({
+          toolName: "get_article",
+          arguments: { article: "A" },
+          meta: { tier: "validated" },
+          rawToolCall: { name: "get_article", arguments: { article: "A" }, _meta: { tier: "raw" } },
+        })
+      ).requestHash,
+    ).toBe(
+      (await bound({ toolName: "get_article", arguments: { article: "A" }, meta: { tier: "raw" } }))
+        .requestHash,
+    );
+    expect(withMeta.requestHash).toBe(MCP_A_HASH);
+    expect(() => bind({ toolName: "get_article", rawToolCall: { name: 7 } })).toThrow(
+      BINDING_ERROR,
+    );
+  });
+
+  it("reads authority headers from a Fetch Headers adapter (Hono, Next)", async () => {
+    const headers = new Headers({ host: "api.example.com" });
+    expect(() => headers.get(":authority")).toThrow();
+    const fetchAdapter = {
+      getMethod: () => "GET",
+      getUrl: () => "http://api.example.com/article/A",
+      getHeader: (name: string) => headers.get(name) ?? undefined,
+      getBody: () => undefined,
+    };
+    const bind = httpTransportBinding({ publicOrigin: "https://api.example.com" });
+    expect((await bind({ request: { adapter: fetchAdapter } })).requestHash).toBe(HTTP_A_HASH);
+    const spoofed = new Headers({ host: "x/search?q=" });
+    const spoofAdapter = {
+      ...fetchAdapter,
+      getUrl: () => "http://x/search?q=/article/B",
+      getHeader: (name: string) => spoofed.get(name) ?? undefined,
+    };
+    await expect(bind({ request: { adapter: spoofAdapter } })).rejects.toThrow(BINDING_ERROR);
+    const failing = {
+      ...fetchAdapter,
+      getHeader: (name: string) => (name === "host" ? headers.get(":bad") : undefined),
+    };
+    await expect(bind({ request: { adapter: failing } })).rejects.toThrow();
+  });
 });
