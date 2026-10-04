@@ -215,6 +215,20 @@ describe("transport bindings", () => {
     expect((await http("https://api.example.com")).resourceUrl).toBe("https://api.example.com/");
   });
 
+  it("defaults to adapter body bytes and refuses a consumed body", async () => {
+    const bind = httpTransportBinding({ publicOrigin: "https://api.example.com" });
+    const ctxWith = (body: unknown, headers: Record<string, string> = {}) => ({
+      request: { adapter: { ...adapter("https://x/article/A", headers), getBody: () => body } },
+    });
+    expect((await bind(ctxWith(undefined))).requestHash).toBe(HTTP_A_HASH);
+    expect((await bind(ctxWith({}, { "content-length": "0" }))).requestHash).toBe(HTTP_A_HASH);
+    expect((await bind(ctxWith(Uint8Array.of(1)))).requestHash).not.toBe(HTTP_A_HASH);
+    expect(() => bind(ctxWith({ a: 1 }, { "content-length": "7" }))).toThrow("raw request body");
+    expect(() => bind(ctxWith({ a: 1 }, { "transfer-encoding": "chunked" }))).toThrow(
+      "raw request body",
+    );
+  });
+
   it("rejects a missing transport context", () => {
     expect(() => httpTransportBinding({ publicOrigin: "https://a.example" })(undefined)).toThrow(
       "invalid_exact_lnbtc_request_binding",

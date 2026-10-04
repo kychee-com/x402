@@ -5,7 +5,7 @@
  * optional chain configuration via environment variables.
  *
  * New chain support should be added here in alphabetic order by network prefix
- * (e.g., "algorand" before "aptos" before "ccd" before "eip155" before "hedera" before "near" before "solana" before "stellar" before "tvm" before "xrpl").
+ * (e.g., "algorand" before "aptos" before "ccd" before "eip155" before "hedera" before "lnbtc" before "near" before "solana" before "stellar" before "tvm" before "xrpl").
  */
 
 import { config } from "dotenv";
@@ -23,6 +23,9 @@ import { ExactHederaScheme } from "@x402/hedera/exact/server";
 import { ExactSvmScheme } from "@x402/svm/exact/server";
 import { KEETA_TESTNET_CAIP2 } from "@x402/keeta";
 import { ExactKeetaScheme } from "@x402/keeta/exact/server";
+import { LNBTC_TESTNET } from "@x402/lnbtc";
+import { ExactLnbtcScheme, httpTransportBinding } from "@x402/lnbtc/exact/server";
+import { NWCClient } from "@getalby/sdk";
 import { NEAR_TESTNET_CAIP2 } from "@x402/near";
 import { ExactNearScheme } from "@x402/near/exact/server";
 import { ExactStellarScheme } from "@x402/stellar/exact/server";
@@ -43,6 +46,9 @@ const ccdAddress = process.env.CCD_ADDRESS as string | undefined;
 const evmAddress = process.env.EVM_ADDRESS as `0x${string}` | undefined;
 const hederaAddress = process.env.HEDERA_ACCOUNT_ID as string | undefined;
 const keetaAddress = process.env.KEETA_ADDRESS as string | undefined;
+// Lightning: payTo is the receiver node public key; NWC_URL must be able to make invoices for it.
+const lnbtcPayTo = process.env.LNBTC_PAY_TO as string | undefined;
+const lnbtcNwcUrl = process.env.LNBTC_NWC_URL as string | undefined;
 const nearAddress = process.env.NEAR_ADDRESS as string | undefined;
 const svmAddress = process.env.SVM_ADDRESS as string | undefined;
 const stellarAddress = process.env.STELLAR_ADDRESS as string | undefined;
@@ -59,6 +65,7 @@ if (
   !evmAddress &&
   !svmAddress &&
   !keetaAddress &&
+  !(lnbtcPayTo && lnbtcNwcUrl) &&
   !nearAddress &&
   !stellarAddress &&
   !hederaAddress &&
@@ -66,7 +73,7 @@ if (
   !xrplAddress
 ) {
   console.error(
-    "❌ At least one of AVM_ADDRESS, APTOS_ADDRESS, CARDANO_ADDRESS, CASPER_ADDRESS, CCD_ADDRESS, EVM_ADDRESS, KEETA_ADDRESS, NEAR_ADDRESS, SVM_ADDRESS, STELLAR_ADDRESS, HEDERA_ACCOUNT_ID, TVM_ADDRESS, or XRPL_ADDRESS is required",
+    "❌ At least one of AVM_ADDRESS, APTOS_ADDRESS, CARDANO_ADDRESS, CASPER_ADDRESS, CCD_ADDRESS, EVM_ADDRESS, KEETA_ADDRESS, LNBTC_PAY_TO + LNBTC_NWC_URL, NEAR_ADDRESS, SVM_ADDRESS, STELLAR_ADDRESS, HEDERA_ACCOUNT_ID, TVM_ADDRESS, or XRPL_ADDRESS is required",
   );
   process.exit(1);
 }
@@ -91,6 +98,7 @@ const CCD_NETWORK = "ccd:4221332d34e1694168c2a0c0b3fd0f27" as const; // Concordi
 const EVM_NETWORK = "eip155:84532" as const; // Base Sepolia
 const HEDERA_NETWORK = "hedera:testnet" as const; // Hedera Testnet
 const KEETA_NETWORK = KEETA_TESTNET_CAIP2; // Keeta Testnet
+const LNBTC_NETWORK = LNBTC_TESTNET; // Bitcoin Lightning (testnet)
 const NEAR_NETWORK = (process.env.NEAR_NETWORK || NEAR_TESTNET_CAIP2) as Network; // NEAR Testnet
 const SVM_NETWORK = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" as const; // Solana Devnet
 const STELLAR_NETWORK = "stellar:testnet" as const; // Stellar Testnet
@@ -194,6 +202,14 @@ if (keetaAddress) {
     payTo: keetaAddress,
   });
 }
+if (lnbtcPayTo && lnbtcNwcUrl) {
+  accepts.push({
+    scheme: "exact",
+    price: "1 sat",
+    network: LNBTC_NETWORK,
+    payTo: lnbtcPayTo,
+  });
+}
 if (nearAddress) {
   accepts.push({
     scheme: "exact",
@@ -266,6 +282,29 @@ if (hederaAddress) {
 }
 if (keetaAddress) {
   server.register(KEETA_NETWORK, new ExactKeetaScheme());
+}
+if (lnbtcPayTo && lnbtcNwcUrl) {
+  const nwc = new NWCClient({ nostrWalletConnectUrl: lnbtcNwcUrl });
+  server.register(
+    LNBTC_NETWORK,
+    new ExactLnbtcScheme({
+      receiver: {
+        createInvoice: async ({ amountMsat, descriptionHash, expirySeconds }) =>
+          (
+            await nwc.makeInvoice({
+              amount: Number(amountMsat),
+              description_hash: descriptionHash,
+              expiry: expirySeconds,
+            })
+          ).invoice,
+      },
+      // Binds each invoice to the actual request. Set the origin clients use to reach this server.
+      requestBinding: httpTransportBinding({
+        publicOrigin:
+          process.env.LNBTC_PUBLIC_ORIGIN || `http://localhost:${process.env.PORT || 4021}`,
+      }),
+    }),
+  );
 }
 if (nearAddress) {
   server.register(NEAR_NETWORK, new ExactNearScheme());
@@ -342,6 +381,9 @@ app.listen(port, () => {
   }
   if (keetaAddress) {
     console.log(`   Keeta: ${keetaAddress} on ${KEETA_NETWORK}`);
+  }
+  if (lnbtcPayTo) {
+    console.log(`   Lightning: ${lnbtcPayTo} on ${LNBTC_NETWORK}`);
   }
   if (nearAddress) {
     console.log(`   NEAR: ${nearAddress} on ${NEAR_NETWORK}`);

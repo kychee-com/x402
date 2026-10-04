@@ -16,10 +16,33 @@ export interface HttpTransportBindingConfig {
   boundHeaders?: readonly string[];
   /**
    * Returns the raw request content bytes. Parsed bodies cannot be used: the
-   * specification hashes the bytes as received. With Express, capture them
-   * with `express.raw()` or a `verify` callback.
+   * specification hashes the bytes as received. Defaults to the adapter's
+   * body when it is bytes (for example after `express.raw()`).
    */
   rawBody?: (context: HTTPTransportContext) => Uint8Array | undefined;
+}
+
+/**
+ * Reads raw body bytes from the adapter. A request without content hashes as
+ * empty; a body that a parser already consumed is refused, because the
+ * original bytes are gone.
+ *
+ * @param context - HTTP transport context
+ * @returns The body bytes
+ */
+function adapterRawBody(context: HTTPTransportContext): Uint8Array {
+  const adapter = context.request.adapter;
+  const body = adapter.getBody?.();
+  if (body instanceof Uint8Array) return body;
+  const length = adapter.getHeader("content-length");
+  const hasContent =
+    adapter.getHeader("transfer-encoding") !== undefined ||
+    (length !== undefined && length.trim() !== "0");
+  if (!hasContent) return new Uint8Array();
+  throw new TypeError(
+    "lnbtc http:1 binding needs the raw request body bytes: mount a raw body parser " +
+      "(e.g. express.raw()) for this route or pass rawBody",
+  );
 }
 
 /**
@@ -37,7 +60,9 @@ export function httpTransportBinding(config: HttpTransportBindingConfig): Server
     return httpRequestBinding({
       method: adapter.getMethod(),
       url: origin + requestTarget(adapter.getUrl()),
-      body: config.rawBody?.(context) ?? new Uint8Array(),
+      body: config.rawBody
+        ? (config.rawBody(context) ?? new Uint8Array())
+        : adapterRawBody(context),
       boundHeaders: config.boundHeaders ?? [],
       getHeader: name => adapter.getHeader(name),
     });
