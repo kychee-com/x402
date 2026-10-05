@@ -223,10 +223,11 @@ function requestTarget(url: string, getHeader: (name: string) => string | undefi
  * Splits a header into its comma-separated hops, as proxies append them.
  *
  * @param value - Header value
- * @returns Trimmed hops
+ * @returns Hops with optional whitespace (spaces and tabs, RFC 9110 OWS)
+ *   trimmed; any other whitespace stays and fails validation
  */
 function hops(value: string): string[] {
-  return value.split(",").map(part => part.trim());
+  return value.split(",").map(part => part.replace(/^[\t ]+|[\t ]+$/g, ""));
 }
 
 /**

@@ -545,6 +545,22 @@ describe("transport bindings", () => {
     await expect(http(`http://${host}/article/A`, { host })).rejects.toThrow(BINDING_ERROR);
   });
 
+  it("trims only spaces and tabs (RFC 9110 OWS) from authority and protocol hops", async () => {
+    const url = "https://api.example.com/article/A";
+    for (const name of ["host", ":authority", "x-forwarded-host"]) {
+      for (const ws of ["\r\n", "\n", "\r", "\v", "\f", " ", "﻿"]) {
+        await expect(http(url, { [name]: `api.example.com${ws}` }), name).rejects.toThrow(
+          BINDING_ERROR,
+        );
+      }
+    }
+    await expect(
+      http(url, { host: "api.example.com", "x-forwarded-proto": "https\r\n" }),
+    ).rejects.toThrow(BINDING_ERROR);
+    const padded = { host: " \tapi.example.com\t ", "x-forwarded-proto": "\thttps , http " };
+    expect((await http(url, padded)).requestHash).toBe(HTTP_A_HASH);
+  });
+
   it("accepts an HTTP/2 :authority without a Host header", async () => {
     const url = "https://api.example.com/article/A";
     expect((await http(url, { ":authority": "api.example.com" })).requestHash).toBe(HTTP_A_HASH);
