@@ -234,8 +234,8 @@ async function main(): Promise<void> {
   }
 
   // Register Lightning scheme if an NWC connection is provided
-  if (lnbtcNwcUrl) {
-    const nwc = new NWCClient({ nostrWalletConnectUrl: lnbtcNwcUrl });
+  const nwc = lnbtcNwcUrl ? new NWCClient({ nostrWalletConnectUrl: lnbtcNwcUrl }) : null;
+  if (nwc) {
     client.register(
       "lnbtc:*",
       new ExactLnbtcScheme({
@@ -337,6 +337,8 @@ async function main(): Promise<void> {
     response.headers.get(name),
   );
   console.log("\nPayment response:", JSON.stringify(paymentResponse, null, 2));
+  // The NWC relay connection keeps the process alive until closed.
+  nwc?.close();
 }
 
 main().catch(error => {

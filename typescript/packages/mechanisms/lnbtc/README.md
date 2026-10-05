@@ -86,11 +86,14 @@ server.register(
   challenge. When a request carries a payment, the server issues nothing: it matches the payment
   using the client's invoice and the binding recomputed from the request.
 
-MCP tools wrapped by `@x402/mcp` use `mcpTransportBinding({ server, boundMetadata })`. Set the
-wrapper's `resource.url` to `mcp://tool/<name>`: the wrapper takes the bound tool name from it.
-The MCP SDK applies a tool's input-schema defaults and transformations before the wrapper sees the
-arguments, while the client binds the arguments it sent, so a paid tool whose schema adds defaults
-or strips unknown keys refuses calls that omit or add those arguments.
+MCP tools wrapped by `@x402/mcp` use `mcpTransportBinding({ server, boundMetadata })`. The
+specification binds the tool call as the client sent it, before the tool's input schema applies
+defaults or strips keys. When the server calls `@x402/mcp`'s `captureRawToolCalls(server)` before
+registering tools, the binding uses that raw call (name, arguments, and `_meta`). Without it, the
+binding uses the wrapper's validated arguments and the tool name from `resource.url`
+(`mcp://tool/<name>`), so a paid tool whose schema adds defaults or strips keys refuses calls that
+omit or add those arguments. Omitted arguments bind as `{}`; give such tools a schema that accepts
+an empty object.
 
 ## Client
 
