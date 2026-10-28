@@ -188,7 +188,9 @@ verify all of the following:
 6. The BOLT11 creation time is not later than the server's validation time plus
    its configured non-negative clock-skew allowance, whose default MUST be 60
    seconds. Equality at this boundary is valid.
-7. The invoice has not expired at the server's validation time.
+7. The invoice has not expired at the server's validation time: that time is not
+   later than the invoice creation time plus its expiry. Equality at this
+   boundary is valid.
 
 The server MUST NOT reuse an invoice across clients or challenges.
 
@@ -552,7 +554,9 @@ Before paying, a client MUST:
 8. Require the invoice expiry to equal `maxTimeoutSeconds` and its creation time to
    be no later than the client's validation time plus its configured non-negative
    clock-skew allowance, whose default MUST be 60 seconds.
-9. Require the invoice to be unexpired at the client's validation time.
+9. Require the invoice to be unexpired at the client's validation time: that time
+   is not later than the invoice creation time plus its expiry. Equality at this
+   boundary is valid.
 10. Ask its payer adapter to pay the invoice on the selected network.
 
 The payer result MUST report `paid` and identify the same invoice, payment hash,
@@ -564,7 +568,11 @@ construct a `PaymentPayload` if a check fails.
 
 ## Facilitator Validation
 
-The `upfront` flow does not invoke facilitator `/verify`. The facilitator's
+The `upfront` flow does not invoke facilitator `/verify`. A facilitator that
+receives `/verify` for this scheme MUST return `isValid: false` with
+`invalid_exact_lnbtc_payment_flow` without validating or recording the proof,
+because a positive result could let a resource server process the request
+before the replay insert. The facilitator's
 `/settle` endpoint MUST treat the payload and echoed requirements as untrusted and
 perform the following checks in order before it records the payment hash:
 
@@ -681,7 +689,7 @@ MUST preserve the validation reason when validation fails.
 | `invalid_exact_lnbtc_request_binding` | A request hash, profile, or parameter object is missing or malformed, or a profile is unsupported. |
 | `invalid_exact_lnbtc_request_mismatch` | The accepted request hash, profile, or parameters differ from the requirement. |
 | `invalid_exact_lnbtc_asset_transfer_method` | Either explicit asset transfer method is not `bolt11`. |
-| `invalid_exact_lnbtc_payment_flow` | Either payment flow is missing or not `upfront`. |
+| `invalid_exact_lnbtc_payment_flow` | Either payment flow is missing or not `upfront`, or `/verify` was called for the `upfront` flow. |
 | `invalid_exact_lnbtc_invoice_missing` | Either required invoice field is absent. |
 | `invalid_exact_lnbtc_invoice_decode_failed` | Strict BOLT11 decoding, signature validation, or integral-msat validation failed. |
 | `invalid_exact_lnbtc_invoice_description` | The invoice does not contain exactly one description hash or contains an inline description. |
