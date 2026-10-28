@@ -39,7 +39,7 @@ Node credentials stay in your application. Each role takes a small adapter:
   is for tests only.
 
 Nostr Wallet Connect (NIP-47) wallets fit both node adapters: `make_invoice` accepts
-`description_hash`, and `pay_invoice` returns the preimage.
+`description_hash`, and `pay_invoice` returns the preimage. See the advanced examples.
 
 ## Server
 
@@ -136,3 +136,14 @@ one.
 ```bash
 pnpm --filter @x402/lnbtc test
 ```
+
+The integration suite runs the full HTTP flow against two LND nodes on regtest:
+
+```bash
+test/regtest/setup.sh            # bitcoind + alice -> bob channel in Docker
+pnpm --filter @x402/lnbtc test:integration
+docker compose -f test/regtest/docker-compose.yml down -v
+```
+
+It reads `test/regtest/.data/env` written by `setup.sh` and skips when it is absent. The regtest
+network id and `bcrt` currency are test-only; the specification defines mainnet and testnet.

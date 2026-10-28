@@ -1751,6 +1751,9 @@ importers:
       '@eslint/js':
         specifier: ^9.24.0
         version: 9.34.0
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.12.1
+        version: 1.26.0(zod@3.25.76)
       '@types/node':
         specifier: ^22.13.4
         version: 22.19.17
@@ -1763,6 +1766,9 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^3.2.7
         version: 3.2.7(vitest@3.2.7(@types/debug@4.1.13)(@types/node@22.19.17)(jsdom@26.1.0(bufferutil@4.0.9)(utf-8-validate@5.0.10))(terser@5.46.1)(tsx@4.21.0)(yaml@2.8.1))
+      '@x402/mcp':
+        specifier: workspace:~
+        version: link:../../mcp
       eslint:
         specifier: ^9.24.0
         version: 9.34.0
@@ -1799,6 +1805,9 @@ importers:
       vitest:
         specifier: ^3.2.7
         version: 3.2.7(@types/debug@4.1.13)(@types/node@22.19.17)(jsdom@26.1.0(bufferutil@4.0.9)(utf-8-validate@5.0.10))(terser@5.46.1)(tsx@4.21.0)(yaml@2.8.1)
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   packages/mechanisms/near:
     dependencies:
