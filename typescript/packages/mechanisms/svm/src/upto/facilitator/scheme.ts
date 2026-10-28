@@ -37,6 +37,7 @@ import {
   submitChannelTransactionWithSigner,
   type ChannelReadPolicy,
   type ChannelRpc,
+  type FacilitatorTransactionVersion,
   type PaymentChannelSvmSigner,
 } from "../../payment-channels/facilitator";
 import {
@@ -46,6 +47,7 @@ import {
 } from "../../payment-channels/voucher";
 import { SettlementCache } from "../../settlement-cache";
 import type { FacilitatorSigningCapabilities, FacilitatorSvmSigner } from "../../signer";
+import { ADVERTISED_TRANSACTION_VERSIONS } from "../../constants";
 import { isUptoSvmPayload, type UptoSvmPayloadV2 } from "../../types";
 import {
   decodeTransactionFromPayload,
@@ -54,7 +56,10 @@ import {
   TransactionOnchainFailureError,
   validateSvmAddress,
 } from "../../utils";
-import { ErrSettlementPending } from "../../exact/facilitator/errors";
+import {
+  ErrSettlementPending,
+  ErrUnsupportedTransactionVersion,
+} from "../../exact/facilitator/errors";
 import {
   CallerIdentityConflictError,
   assertPaymentChannelStorage,
@@ -65,7 +70,10 @@ import {
   type PaymentChannelStorage,
 } from "../../payment-channels/storage";
 import { resolveUptoSvmPaymentChannelConfig, type UptoSvmPaymentChannelConfig } from "../shared";
-import { UptoSvmRentCleanupManager } from "./rentCleanupManager";
+import {
+  resolveFacilitatorTransactionVersion,
+  UptoSvmRentCleanupManager,
+} from "./rentCleanupManager";
 
 /** Scheme-specific error returned when the settlement amount exceeds the ceiling. */
 export const ERR_SETTLEMENT_EXCEEDS_AMOUNT = "invalid_upto_svm_payload_settlement_exceeds_amount";
@@ -82,6 +90,20 @@ export const ERR_CHANNEL_ALREADY_OPEN = "invalid_upto_svm_channel_already_open";
  * reached the chain and the deposit is safe to retry.
  */
 export const ERR_CHANNEL_BROADCAST = "invalid_upto_svm_channel_broadcast";
+
+/**
+ * Map unsupported client transaction versions to their stable reason code.
+ *
+ * @param error - The client-open verification error
+ * @param fallback - Reason for failures unrelated to the transaction version
+ * @returns The stable response reason
+ */
+function openTransactionFailureReason(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith(ErrUnsupportedTransactionVersion)
+    ? ErrUnsupportedTransactionVersion
+    : fallback;
+}
 
 /** `maxTimeoutSeconds` or `expiresAt` exceeds facilitator `maxChannelLifetimeSecs`. */
 export const ERR_CHANNEL_LIFETIME_EXCEEDED = "invalid_upto_svm_payload_channel_lifetime_exceeded";
@@ -183,27 +205,42 @@ export interface UptoSvmFacilitatorConfig {
    */
   maxRequiredSignatures?: number;
   /**
-   * `SetComputeUnitPrice` (microlamports per compute unit) attached to
-   * facilitator-submitted settlement transactions (claim, zero-charge cancel,
-   * and rent cleanup via {@link UptoSvmScheme.createRentCleanupManager}).
-   * `0` omits the instruction. The priority fee is charged on the requested
-   * compute-unit limit, which these transactions size statically.
+   * Priority price (microlamports per compute unit) for facilitator-submitted
+   * v1 settlement transactions. It is converted to v1's total lamport fee;
+   * `0` omits the config field. Under v0 it is a `SetComputeUnitPrice`
+   * instruction instead, omitted at `0`.
    *
    * Default: `DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS` (1)
    */
   computeUnitPriceMicroLamports?: number;
   /**
-   * `SetComputeUnitLimit` for facilitator-submitted settlement transactions
+   * Inline v1 compute-unit limit for facilitator-submitted settlement transactions
    * (claim, zero-charge cancel, and rent-cleanup close/distribute). The
    * default (`DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT` = 100k) assumes standard SPL
    * Token settlement with a single-recipient distribution; raise it for
    * compute-heavy Token-2022 extension mints (e.g. transfer hooks) or
    * unusually large distributions. Reclaim batches size themselves per
    * channel and are mint-independent, so they are not affected by this cap.
+   * Under v0 it is a `SetComputeUnitLimit` instruction instead.
    *
    * Default: `DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT` (100,000)
    */
   settleComputeUnitLimit?: number;
+  /**
+   * Inline v1 loaded-account-data budget for facilitator-submitted settlement
+   * transactions. Defaults to 4 MiB, sized for mainnet Token-2022. Reclaim
+   * batches derive their own budget per channel. Ignored under v0, which has
+   * no loaded-account-data instruction.
+   */
+  settleLoadedAccountsDataSizeLimit?: number;
+  /**
+   * Message version (0 or 1) of the claim, cancel, and rent-cleanup
+   * transactions the facilitator builds and signs itself. It does not affect
+   * which client-built versions are accepted. Any other value throws.
+   *
+   * Default: `DEFAULT_FACILITATOR_TRANSACTION_VERSION` (1)
+   */
+  facilitatorTransactionVersion?: FacilitatorTransactionVersion;
   /**
    * Lets a retried deposit (open) or claim (settle_and_seal + distribute)
    * settle for the same channel reconcile against an already-broadcast
@@ -289,6 +326,7 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
   private readonly authorizerSigner: MessagePartialSigner | undefined;
   private readonly resolveCallerIdentity: UptoSvmFacilitatorConfig["resolveCallerIdentity"];
   private readonly signer: PaymentChannelFacilitatorSigner;
+  private readonly facilitatorTransactionVersion: FacilitatorTransactionVersion;
 
   private readonly getKitSigner: (feePayer: Address) => FacilitatorSigningCapabilities;
 
@@ -309,6 +347,10 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
     assertLimit("maxRequiredSignatures", config.maxRequiredSignatures, 1);
     assertLimit("computeUnitPriceMicroLamports", config.computeUnitPriceMicroLamports, 0);
     assertLimit("settleComputeUnitLimit", config.settleComputeUnitLimit, 1);
+    assertLimit("settleLoadedAccountsDataSizeLimit", config.settleLoadedAccountsDataSizeLimit, 1);
+    this.facilitatorTransactionVersion = resolveFacilitatorTransactionVersion(
+      config.facilitatorTransactionVersion,
+    );
     assertPaymentChannelFacilitatorSigner(signer, "UptoSvmScheme");
     this.signer = signer;
     this.getKitSigner = signer.getSigner.bind(signer);
@@ -358,6 +400,8 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
       computeUnitPriceMicroLamports: this.config.computeUnitPriceMicroLamports,
       network,
       settleComputeUnitLimit: this.config.settleComputeUnitLimit,
+      settleLoadedAccountsDataSizeLimit: this.config.settleLoadedAccountsDataSizeLimit,
+      facilitatorTransactionVersion: this.facilitatorTransactionVersion,
       signer: cleanupSigner,
       storage: this.channelStorage,
     });
@@ -373,7 +417,10 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
   getExtra(_: Network): Record<string, unknown> | undefined {
     const addresses = this.signer.getAddresses();
     const randomIndex = Math.floor(Math.random() * addresses.length);
-    const extra: Record<string, unknown> = { feePayer: addresses[randomIndex] };
+    const extra: Record<string, unknown> = {
+      feePayer: addresses[randomIndex],
+      transactionVersions: [...ADVERTISED_TRANSACTION_VERSIONS],
+    };
     if (this.authorizerSigner) {
       extra.receiverAuthorizer = this.authorizerSigner.address;
     }
@@ -710,7 +757,7 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
         success: false,
         network: payload.accepted.network,
         transaction: "",
-        errorReason: "invalid_upto_svm_settlement_simulation",
+        errorReason: openTransactionFailureReason(error, "invalid_upto_svm_settlement_simulation"),
         errorMessage: error instanceof Error ? error.message : String(error),
         payer: p.from,
       };
@@ -1062,7 +1109,9 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
         instructions,
         {
           computeUnitLimit: this.config.settleComputeUnitLimit,
+          loadedAccountsDataSizeLimit: this.config.settleLoadedAccountsDataSizeLimit,
           computeUnitPriceMicroLamports: this.config.computeUnitPriceMicroLamports,
+          facilitatorTransactionVersion: this.facilitatorTransactionVersion,
           latestBlockhash: prefetchedBlockhash,
         },
       );
@@ -1413,7 +1462,7 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
       return {
         ok: false,
         failure: {
-          reason: "invalid_upto_svm_payload_open_transaction",
+          reason: openTransactionFailureReason(error, "invalid_upto_svm_payload_open_transaction"),
           message: error instanceof Error ? error.message : String(error),
           payer: p.from,
         },
